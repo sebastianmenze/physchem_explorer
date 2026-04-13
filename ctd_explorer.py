@@ -71,11 +71,22 @@ with st.sidebar:
     st.markdown("## 🌊 CTD Explorer")
     st.markdown("---")
 
+    st.markdown("### Cruise")
+    cruises = ["— All —"] + sorted([
+        r[0] for r in con.execute(
+            "SELECT DISTINCT cruise FROM missions WHERE cruise IS NOT NULL ORDER BY 1"
+        ).fetchall()
+    ])
+    cruise_filter = st.selectbox("Cruise number", cruises)
+    cruise_active = cruise_filter != "— All —"
+
     st.markdown("### Time range")
+    if cruise_active:
+        st.caption("ℹ️ Date filter inactive while a cruise is selected.")
     default_end   = date.today()
     default_start = default_end - timedelta(days=365)
-    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start))
-    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end))
+    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start), disabled=cruise_active)
+    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end),   disabled=cruise_active)
     try:
         date_start = date.fromisoformat(date_start_str.strip())
     except ValueError:
@@ -110,9 +121,6 @@ with st.sidebar:
     ])
     platform_filter = st.selectbox("Platform", platforms)
 
-    st.markdown("### Cruise")
-    cruise_filter = st.text_input("Cruise number (leave blank for all)", value="")
-
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
@@ -128,20 +136,28 @@ if "map_center"   not in st.session_state: st.session_state.map_center   = None
 
 # ── query ─────────────────────────────────────────────────────────────────────
 def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter=""):
-    extra_clauses = ""
-    params = [
-        str(date_start) + "T00:00:00",
-        str(date_end)   + "T23:59:59",
-        lat_min, lat_max,
-        lon_min, lon_max,
+    cruise_filter = (cruise_filter or "").strip()
+    cruise_active = bool(cruise_filter) and cruise_filter != "— All —"
+
+    where_parts = [
+        "o.latitude_start  BETWEEN ? AND ?",
+        "o.longitude_start BETWEEN ? AND ?",
+        "o.latitude_start  IS NOT NULL",
+        "o.longitude_start IS NOT NULL",
     ]
+    params = [lat_min, lat_max, lon_min, lon_max]
+
+    if not cruise_active:
+        where_parts.insert(0, "o.time_start BETWEEN ? AND ?")
+        params = [str(date_start) + "T00:00:00", str(date_end) + "T23:59:59"] + params
+
     if platform_filter != "All":
-        extra_clauses += " AND m.platform_name = ?"
+        where_parts.append("m.platform_name = ?")
         params.append(platform_filter)
-    cruise_filter = cruise_filter.strip()
-    if cruise_filter:
-        extra_clauses += " AND m.cruise ILIKE ?"
-        params.append(f"%{cruise_filter}%")
+
+    if cruise_active:
+        where_parts.append("m.cruise = ?")
+        params.append(cruise_filter)
 
     return con.execute(f"""
         SELECT
@@ -162,12 +178,7 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
             m.chief_scientist
         FROM operations o
         JOIN missions m USING (mission_id)
-        WHERE o.time_start BETWEEN ? AND ?
-          AND o.latitude_start  BETWEEN ? AND ?
-          AND o.longitude_start BETWEEN ? AND ?
-          AND o.latitude_start  IS NOT NULL
-          AND o.longitude_start IS NOT NULL
-          {extra_clauses}
+        WHERE {" AND ".join(where_parts)}
         ORDER BY o.time_start DESC
     """, params).df()
 
