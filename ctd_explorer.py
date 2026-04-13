@@ -759,8 +759,13 @@ if not df.empty:
     n_readings = get_reading_count(op_ids)
 
     # ── size estimates (before preparation) ───────────────────────────────────
-    # Assumptions: ~5 param cols + ~25 metadata cols, 8 bytes/cell for CSV,
-    # Excel ~55% of CSV, NetCDF ~25% of CSV (binary + compression)
+    # Wide-format pivot means many NaN cells (only params present in each op
+    # are non-null). Model accounts for sparsity:
+    #   Metadata cols (~23): text, mostly non-null, ~10 bytes/cell
+    #   Param value cells:   fill_rate * 6 bytes + (1-fill_rate) * 1 byte
+    #   QC flag cells:       fill_rate * 2 bytes + (1-fill_rate) * 1 byte
+    # Excel: xlsx zipped XML, ~25% of CSV for sparse numeric data
+    # NetCDF: float32 + zlib6, ~10% of CSV
     n_ops      = len(df)
     n_param_est = con.execute(f"""
         SELECT COUNT(DISTINCT p.parameter_code)
@@ -768,7 +773,6 @@ if not df.empty:
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id IN ({",".join(str(i) for i in op_ids)})
     """).fetchone()[0] or 5
-    n_cols_est  = n_param_est * 2 + 25   # params + QC flags + metadata
     # pivoted rows ~ unique (operation_id, sample_number) combos
     n_rows_est  = con.execute(f"""
         SELECT COUNT(DISTINCT i.operation_id || '_' || r.sample_number)
@@ -778,38 +782,39 @@ if not df.empty:
         WHERE i.operation_id IN ({",".join(str(i) for i in op_ids)})
     """).fetchone()[0] or n_readings
 
-    bytes_per_cell_csv = 8
-    # CSV: text, ~8 chars/cell average
-    # Excel: xlsx is zipped XML — roughly 40% of CSV for numeric-heavy data
-    # NetCDF: float32 + zlib6, roughly 15% of CSV
-    csv_est   = n_rows_est * n_cols_est * 8
-    excel_est = int(csv_est * 0.40)
-    nc_est    = int(csv_est * 0.15)
+    _META_COLS  = 23
+    _FILL       = 0.55   # fraction of param/QC cells that are non-null
+    _meta_bpr   = _META_COLS * 10
+    _param_bpr  = n_param_est * (_FILL * 6 + (1 - _FILL) * 1)
+    _qc_bpr     = n_param_est * (_FILL * 2 + (1 - _FILL) * 1)
+    csv_est   = int(n_rows_est * (_meta_bpr + _param_bpr + _qc_bpr))
+    excel_est = int(csv_est * 0.25)
+    nc_est    = int(csv_est * 0.10)
 
     def fmt_size(b):
         if b < 1024:       return f"{b} B"
         elif b < 1024**2:  return f"{b/1024:.0f} KB"
         else:              return f"{b/1024**2:.1f} MB"
 
-    st.caption(f"{n_ops:,} operations · ~{n_rows_est:,} rows · ~{n_param_est} parameters")
+    st.caption(f"{n_ops:,} operations · ~{n_rows_est:,} rows · ~{n_param_est} parameters  ·  file sizes are estimates")
 
     size_c1, size_c2, size_c3, size_c4 = st.columns(4)
-    size_c1.metric("Estimated rows", f"{n_rows_est:,}")
-    size_c2.metric("CSV",            fmt_size(csv_est))
-    size_c3.metric("NetCDF",         fmt_size(nc_est))
-    size_c4.metric("Excel",          fmt_size(excel_est))
+    size_c1.metric("Rows (est.)",    f"~{n_rows_est:,}")
+    size_c2.metric("CSV (est.)",     f"~{fmt_size(csv_est)}")
+    size_c3.metric("NetCDF (est.)",  f"~{fmt_size(nc_est)}")
+    size_c4.metric("Excel (est.)",   f"~{fmt_size(excel_est)}")
 
     _limit = 500 * 1024 * 1024  # 500 MB
     if csv_est > _limit:
         st.warning(
-            f"The estimated CSV size is **{fmt_size(csv_est)}**, which is large and may be slow to "
+            f"The estimated CSV size is **~{fmt_size(csv_est)}**, which is large and may be slow to "
             f"generate and download. Consider reducing your selection by: "
             f"narrowing the **date range**, drawing a smaller **bounding box** on the map, "
             f"or filtering by a specific **platform**."
         )
     elif excel_est > _limit:
         st.warning(
-            f"The estimated Excel size is **{fmt_size(excel_est)}**. "
+            f"The estimated Excel size is **~{fmt_size(excel_est)}**. "
             f"Excel handles large files poorly — consider using CSV or NetCDF instead, "
             f"or reduce the selection."
         )
