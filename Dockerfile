@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir \
     numpy \
     openpyxl \
     xarray \
-    h5netcdf
+    h5netcdf \
+    h5py
 
 # Copy app
 COPY ctd_explorer.py .
