@@ -137,6 +137,18 @@ with st.sidebar:
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
 
+# Ensure drawn bbox always takes precedence over number input widget state.
+# Streamlit caches widget values between reruns and may ignore a changed
+# value= parameter, causing stale defaults to be used instead of the newly
+# drawn rectangle. Override here so the search always uses the stored shape.
+_db = st.session_state.get("drawn_bbox", {})
+if _db and not st.session_state.get("drawn_polygon"):
+    lat_min = float(_db["lat_min"])
+    lat_max = float(_db["lat_max"])
+    lon_min = float(_db["lon_min"])
+    lon_max = float(_db["lon_max"])
+
+
 # ── session state ─────────────────────────────────────────────────────────────
 if "results"      not in st.session_state: st.session_state.results      = pd.DataFrame()
 if "selected_op"  not in st.session_state: st.session_state.selected_op  = None
