@@ -188,10 +188,11 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
     return con.execute("""
         SELECT
             r.sample_number,
-            MAX(CASE WHEN p.parameter_code = 'PRES' THEN r.value_dec END) AS pressure,
-            MAX(CASE WHEN p.parameter_code = 'TEMP' THEN r.value_dec END) AS temperature,
-            MAX(CASE WHEN p.parameter_code = 'PSAL' THEN r.value_dec END) AS salinity,
-            MAX(CASE WHEN p.parameter_code = 'DOXY' THEN r.value_dec END) AS oxygen
+            MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
+            MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
+            MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
+            MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
+            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
         FROM readings r
         JOIN parameters  p USING (parameter_id)
         JOIN instruments i USING (instrument_id)
@@ -299,15 +300,20 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
 # ── build T/S profile chart ───────────────────────────────────────────────────
 def build_profile_chart(df: pd.DataFrame, op_id: int):
     has_temp = df["temperature"].notna().any()
-    has_sal  = df["salinity"].notna().any()
     has_oxy  = df["oxygen"].notna().any()
+
+    # Prefer PSAL_ADJUSTED; fall back to PSAL
+    use_sal_adj = "salinity_adj" in df.columns and df["salinity_adj"].notna().any()
+    sal_col     = "salinity_adj" if use_sal_adj else "salinity"
+    sal_label   = "Salinity adj. (PSU)" if use_sal_adj else "Salinity (PSU)"
+    has_sal     = df[sal_col].notna().any()
 
     n_cols  = int(sum([has_temp, has_sal, has_oxy]))
     if n_cols == 0:
         return None
 
     titles = [t for t, h in [("Temperature (°C)", has_temp),
-                               ("Salinity (PSU)",   has_sal),
+                               (sal_label,          has_sal),
                                ("Oxygen",           has_oxy)] if h]
 
     fig = make_subplots(rows=1, cols=n_cols, shared_yaxes=True, subplot_titles=titles,
@@ -324,8 +330,8 @@ def build_profile_chart(df: pd.DataFrame, op_id: int):
 
     if has_sal:
         fig.add_trace(go.Scatter(
-            x=df["salinity"], y=pres, mode="lines",
-            line=dict(color="#1a73e8", width=2), name="Salinity",
+            x=df[sal_col], y=pres, mode="lines",
+            line=dict(color="#1a73e8", width=2), name=sal_label,
         ), row=1, col=col); col += 1
 
     if has_oxy:
