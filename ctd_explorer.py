@@ -521,7 +521,16 @@ if st.session_state.selected_op is not None:
             st.markdown("<div class='section-header'>T/S Profile</div>", unsafe_allow_html=True)
             fig = build_profile_chart(profile, op_id)
             if fig:
-                st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(fig, width='stretch', config={
+                    "displayModeBar": True,
+                    "modeBarButtonsToRemove": [
+                        "autoScale2d", "lasso2d", "select2d",
+                        "toggleSpikelines", "hoverClosestCartesian",
+                        "hoverCompareCartesian",
+                    ],
+                    "modeBarButtonsToAdd": [],
+                    "displaylogo": False,
+                })
             else:
                 st.caption("No TEMP/PSAL/PRES readings found for this operation.")
             with st.expander("Raw profile data"):
