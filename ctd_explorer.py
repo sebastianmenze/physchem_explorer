@@ -98,20 +98,32 @@ with st.sidebar:
         st.caption("Invalid end date")
         date_end = default_end
 
-    st.markdown("### Bounding box")
-    st.caption("Draw a rectangle on the map, or enter coordinates manually")
-    drawn = st.session_state.get("drawn_bbox", {})
-    col1, col2 = st.columns(2)
-    with col1:
-        lat_min = st.number_input("Lat min", value=float(drawn.get("lat_min", -90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
-        lon_min = st.number_input("Lon min", value=float(drawn.get("lon_min", -180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
-    with col2:
-        lat_max = st.number_input("Lat max", value=float(drawn.get("lat_max", 90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
-        lon_max = st.number_input("Lon max", value=float(drawn.get("lon_max", 180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
-    if drawn:
-        if st.button("✕  Clear drawn box", width='stretch'):
-            st.session_state.drawn_bbox = {}
+    st.markdown("### Area filter")
+    _poly  = st.session_state.get("drawn_polygon", [])
+    _drawn = st.session_state.get("drawn_bbox", {})
+    if _poly:
+        st.caption(f"Polygon drawn ({len(_poly)} vertices) — bounding box inputs inactive.")
+        # Derive bbox from polygon for the SQL pre-filter
+        _poly_lats = [p[0] for p in _poly]
+        _poly_lons = [p[1] for p in _poly]
+        lat_min = float(min(_poly_lats));  lat_max = float(max(_poly_lats))
+        lon_min = float(min(_poly_lons));  lon_max = float(max(_poly_lons))
+        if st.button("✕  Clear polygon", width='stretch'):
+            st.session_state.drawn_polygon = []
             st.rerun()
+    else:
+        st.caption("Draw a rectangle or polygon on the map, or enter coordinates manually")
+        col1, col2 = st.columns(2)
+        with col1:
+            lat_min = st.number_input("Lat min", value=float(_drawn.get("lat_min", -90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
+            lon_min = st.number_input("Lon min", value=float(_drawn.get("lon_min", -180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
+        with col2:
+            lat_max = st.number_input("Lat max", value=float(_drawn.get("lat_max", 90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
+            lon_max = st.number_input("Lon max", value=float(_drawn.get("lon_max", 180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
+        if _drawn:
+            if st.button("✕  Clear drawn box", width='stretch'):
+                st.session_state.drawn_bbox = {}
+                st.rerun()
 
     st.markdown("### Platform filter")
     platforms = ["All"] + sorted([
@@ -131,7 +143,29 @@ if "selected_op"  not in st.session_state: st.session_state.selected_op  = None
 if "profile"      not in st.session_state: st.session_state.profile      = pd.DataFrame()
 if "last_clicked" not in st.session_state: st.session_state.last_clicked = None
 if "drawn_bbox"   not in st.session_state: st.session_state.drawn_bbox   = {}
+if "drawn_polygon" not in st.session_state: st.session_state.drawn_polygon = []
 if "map_center"   not in st.session_state: st.session_state.map_center   = None
+
+
+# ── polygon point-in-polygon filter (ray-casting, no extra deps) ──────────────
+def _pip(lat: float, lon: float, poly: list) -> bool:
+    """Return True if (lat, lon) is inside the polygon [[lat,lon], ...]."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((xi > lon) != (xj > lon)) and (lat < (yj - yi) * (lon - xi) / (xj - xi) + yi):
+            inside = not inside
+        j = i
+    return inside
+
+def filter_by_polygon(df: pd.DataFrame, poly: list) -> pd.DataFrame:
+    if not poly or df.empty:
+        return df
+    mask = [_pip(float(row.lat), float(row.lon), poly) for _, row in df.iterrows()]
+    return df[mask].reset_index(drop=True)
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
@@ -232,19 +266,28 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
         </script>
     """))
 
-    # Draw toolbar — rectangle only
+    # Draw toolbar — rectangle + polygon
+    _shape_opts = {"color": "#1a73e8", "weight": 2, "fillOpacity": 0.05}
     Draw(
         export=False,
         draw_options={
-            "rectangle": {"shapeOptions": {"color": "#1a73e8", "weight": 2, "fillOpacity": 0.05}},
-            "polyline": False, "polygon": False, "circle": False,
+            "rectangle": {"shapeOptions": _shape_opts},
+            "polygon":   {"shapeOptions": _shape_opts},
+            "polyline": False, "circle": False,
             "marker": False, "circlemarker": False,
         },
         edit_options={"edit": False, "remove": True},
     ).add_to(m)
 
-    # Draw bounding box if not global
-    if not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
+    # Render active polygon or bounding box
+    _active_poly = st.session_state.get("drawn_polygon", [])
+    if _active_poly:
+        folium.Polygon(
+            locations=_active_poly,
+            color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
+            dash_array="6",
+        ).add_to(m)
+    elif not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
         folium.Rectangle(
             bounds=[[lat_min, lon_min], [lat_max, lon_max]],
             color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
@@ -362,7 +405,10 @@ if not check_db():
 # ── run search ────────────────────────────────────────────────────────────────
 if search_clicked:
     with st.spinner("Searching..."):
-        st.session_state.results     = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
+        _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
+        if st.session_state.get("drawn_polygon"):
+            _results = filter_by_polygon(_results, st.session_state.drawn_polygon)
+        st.session_state.results     = _results
         st.session_state.selected_op = None
         st.session_state.profile     = pd.DataFrame()
         st.session_state.map_center  = None
@@ -390,24 +436,34 @@ map_data = st_folium(
     returned_objects=["last_object_clicked", "all_drawings"],
 )
 
-# handle drawn rectangle
+# handle drawn shapes (rectangle or polygon)
 drawings = (map_data or {}).get("all_drawings")
 if drawings:
     for feature in drawings:
-        geom = feature.get("geometry", {})
+        geom  = feature.get("geometry", {})
+        props = feature.get("properties", {})
         if geom.get("type") == "Polygon":
-            coords = geom["coordinates"][0]
+            coords = geom["coordinates"][0]   # [[lon, lat], ...]
             lons = [c[0] for c in coords]
             lats = [c[1] for c in coords]
-            new_bbox = {
-                "lat_min": round(min(lats), 4),
-                "lat_max": round(max(lats), 4),
-                "lon_min": round(min(lons), 4),
-                "lon_max": round(max(lons), 4),
-            }
-            if new_bbox != st.session_state.get("drawn_bbox"):
-                st.session_state.drawn_bbox = new_bbox
-                st.rerun()
+            if props.get("type") == "rectangle":
+                new_bbox = {
+                    "lat_min": round(min(lats), 4),
+                    "lat_max": round(max(lats), 4),
+                    "lon_min": round(min(lons), 4),
+                    "lon_max": round(max(lons), 4),
+                }
+                if new_bbox != st.session_state.get("drawn_bbox") or st.session_state.get("drawn_polygon"):
+                    st.session_state.drawn_bbox    = new_bbox
+                    st.session_state.drawn_polygon = []
+                    st.rerun()
+            else:
+                # Free polygon — store as [[lat, lon], ...] (drop closing duplicate)
+                new_poly = [[round(c[1], 4), round(c[0], 4)] for c in coords[:-1]]
+                if new_poly != st.session_state.get("drawn_polygon"):
+                    st.session_state.drawn_polygon = new_poly
+                    st.session_state.drawn_bbox    = {}
+                    st.rerun()
 
 # detect marker click
 clicked = (map_data or {}).get("last_object_clicked")
