@@ -73,7 +73,7 @@ with st.sidebar:
 
     st.markdown("### Time range")
     default_end   = date.today()
-    default_start = default_end - timedelta(days=90)
+    default_start = default_end - timedelta(days=365)
     date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start))
     date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end))
     try:
