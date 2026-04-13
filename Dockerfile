@@ -22,7 +22,7 @@ COPY ctd_explorer.py .
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+    CMD curl -f http://localhost:8501/physchem-explorer/_stcore/health || exit 1
 
 CMD ["python", "-m", "streamlit", "run", "ctd_explorer.py", \
      "--server.port=8501", \
@@ -31,4 +31,5 @@ CMD ["python", "-m", "streamlit", "run", "ctd_explorer.py", \
      "--server.fileWatcherType=none", \
      "--server.maxUploadSize=500", \
      "--server.enableCORS=false", \
-     "--server.enableXsrfProtection=false"]
+     "--server.enableXsrfProtection=false", \
+     "--server.baseUrlPath=physchem-explorer"]
