@@ -929,11 +929,9 @@ if not df.empty:
     # ── CSV ───────────────────────────────────────────────────────────────────
     with dl_col1:
         if edf is None:
-            st.button("CSV — preparing...", disabled=True, width='stretch')
+            st.button("Download CSV", disabled=True, width='stretch')
         elif export_key + "_csv" not in st.session_state:
-            # Build CSV now and rerun to show NetCDF spinner
-            with st.spinner("Building CSV..."):
-                st.session_state[export_key + "_csv"] = edf.to_csv(index=False).encode("utf-8")
+            st.session_state[export_key + "_csv"] = edf.to_csv(index=False).encode("utf-8")
             st.rerun()
         else:
             csv_bytes = st.session_state[export_key + "_csv"]
@@ -951,16 +949,15 @@ if not df.empty:
             st.button("Download NetCDF", disabled=True, width='stretch')
             st.caption(f"Run: `pip install {' '.join(_nc_missing)}`")
         elif edf is None or export_key + "_csv" not in st.session_state:
-            st.button("NetCDF — waiting...", disabled=True, width='stretch')
+            st.button("Download NetCDF", disabled=True, width='stretch')
         elif export_key + "_nc_err" in st.session_state:
             st.button("Download NetCDF", disabled=True, width='stretch')
             st.caption(f"Error: {st.session_state[export_key + '_nc_err']}")
         elif export_key + "_nc" not in st.session_state:
-            with st.spinner("Building NetCDF..."):
-                try:
-                    st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf)
-                except Exception as e:
-                    st.session_state[export_key + "_nc_err"] = str(e)
+            try:
+                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf)
+            except Exception as e:
+                st.session_state[export_key + "_nc_err"] = str(e)
             st.rerun()
         else:
             nc_bytes = st.session_state[export_key + "_nc"]
@@ -974,14 +971,13 @@ if not df.empty:
 
     # ── Excel ─────────────────────────────────────────────────────────────────
     with dl_col3:
-        if edf is None or export_key + "_nc" not in st.session_state and export_key + "_nc_err" not in st.session_state:
-            st.button("Excel — waiting...", disabled=True, width='stretch')
+        if edf is None or (export_key + "_nc" not in st.session_state and export_key + "_nc_err" not in st.session_state):
+            st.button("Download Excel", disabled=True, width='stretch')
         elif export_key + "_xl" not in st.session_state:
-            with st.spinner("Building Excel..."):
-                xl_buf = io.BytesIO()
-                with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
-                    edf.to_excel(writer, sheet_name="Readings", index=False)
-                st.session_state[export_key + "_xl"] = xl_buf.getvalue()
+            xl_buf = io.BytesIO()
+            with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
+                edf.to_excel(writer, sheet_name="Readings", index=False)
+            st.session_state[export_key + "_xl"] = xl_buf.getvalue()
             st.rerun()
         else:
             xl_bytes = st.session_state[export_key + "_xl"]
