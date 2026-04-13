@@ -39,7 +39,7 @@ st.set_page_config(
 # ── minimal styling ────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
+    .block-container { padding-top: 3.5rem; padding-bottom: 1rem; }
     .stMetric label { font-size: 0.75rem !important; }
     div[data-testid="stSidebarContent"] { padding-top: 1.5rem; }
     .op-meta-label { font-size: 0.72rem; color: #888; text-transform: uppercase;
