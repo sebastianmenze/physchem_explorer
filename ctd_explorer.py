@@ -110,6 +110,9 @@ with st.sidebar:
     ])
     platform_filter = st.selectbox("Platform", platforms)
 
+    st.markdown("### Cruise")
+    cruise_filter = st.text_input("Cruise number (leave blank for all)", value="")
+
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
@@ -124,8 +127,8 @@ if "map_center"   not in st.session_state: st.session_state.map_center   = None
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
-def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter):
-    platform_clause = ""
+def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter=""):
+    extra_clauses = ""
     params = [
         str(date_start) + "T00:00:00",
         str(date_end)   + "T23:59:59",
@@ -133,8 +136,12 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
         lon_min, lon_max,
     ]
     if platform_filter != "All":
-        platform_clause = "AND m.platform_name = ?"
+        extra_clauses += " AND m.platform_name = ?"
         params.append(platform_filter)
+    cruise_filter = cruise_filter.strip()
+    if cruise_filter:
+        extra_clauses += " AND m.cruise ILIKE ?"
+        params.append(f"%{cruise_filter}%")
 
     return con.execute(f"""
         SELECT
@@ -160,7 +167,7 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
           AND o.longitude_start BETWEEN ? AND ?
           AND o.latitude_start  IS NOT NULL
           AND o.longitude_start IS NOT NULL
-          {platform_clause}
+          {extra_clauses}
         ORDER BY o.time_start DESC
     """, params).df()
 
@@ -338,7 +345,7 @@ if not check_db():
 # ── run search ────────────────────────────────────────────────────────────────
 if search_clicked:
     with st.spinner("Searching..."):
-        st.session_state.results     = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter)
+        st.session_state.results     = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
         st.session_state.selected_op = None
         st.session_state.profile     = pd.DataFrame()
         st.session_state.map_center  = None
