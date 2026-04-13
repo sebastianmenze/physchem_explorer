@@ -788,7 +788,7 @@ if not df.empty:
     _param_bpr  = n_param_est * (_FILL * 6 + (1 - _FILL) * 1)
     _qc_bpr     = n_param_est * (_FILL * 2 + (1 - _FILL) * 1)
     csv_est   = int(n_rows_est * (_meta_bpr + _param_bpr + _qc_bpr))
-    excel_est = int(csv_est * 0.25)
+    excel_est = int(csv_est * 0.90)   # xlsx ≈ CSV size: XML verbosity offsets zip compression
     nc_est    = int(csv_est * 0.10)
 
     def fmt_size(b):
