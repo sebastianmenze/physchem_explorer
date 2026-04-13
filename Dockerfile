@@ -29,4 +29,6 @@ CMD ["python", "-m", "streamlit", "run", "ctd_explorer.py", \
      "--server.address=0.0.0.0", \
      "--server.headless=true", \
      "--server.fileWatcherType=none", \
-     "--server.maxUploadSize=500"]
+     "--server.maxUploadSize=500", \
+     "--server.enableCORS=false", \
+     "--server.enableXsrfProtection=false"]
