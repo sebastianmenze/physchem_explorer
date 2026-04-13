@@ -144,7 +144,6 @@ if "profile"      not in st.session_state: st.session_state.profile      = pd.Da
 if "last_clicked" not in st.session_state: st.session_state.last_clicked = None
 if "drawn_bbox"   not in st.session_state: st.session_state.drawn_bbox   = {}
 if "drawn_polygon"  not in st.session_state: st.session_state.drawn_polygon  = []
-if "auto_search"    not in st.session_state: st.session_state.auto_search    = False
 if "map_center"   not in st.session_state: st.session_state.map_center   = None
 
 
@@ -400,8 +399,7 @@ if not check_db():
     st.stop()
 
 # ── run search ────────────────────────────────────────────────────────────────
-if search_clicked or st.session_state.get("auto_search"):
-    st.session_state.auto_search = False
+if search_clicked:
     with st.spinner("Searching..."):
         _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
         if st.session_state.get("drawn_polygon"):
@@ -461,7 +459,6 @@ if drawings:
                 if new_poly != st.session_state.get("drawn_polygon"):
                     st.session_state.drawn_polygon = new_poly
                     st.session_state.drawn_bbox    = {}
-                    st.session_state.auto_search   = True
                     st.rerun()
 
 # detect marker click
