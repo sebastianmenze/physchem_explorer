@@ -143,7 +143,8 @@ if "selected_op"  not in st.session_state: st.session_state.selected_op  = None
 if "profile"      not in st.session_state: st.session_state.profile      = pd.DataFrame()
 if "last_clicked" not in st.session_state: st.session_state.last_clicked = None
 if "drawn_bbox"   not in st.session_state: st.session_state.drawn_bbox   = {}
-if "drawn_polygon" not in st.session_state: st.session_state.drawn_polygon = []
+if "drawn_polygon"  not in st.session_state: st.session_state.drawn_polygon  = []
+if "auto_search"    not in st.session_state: st.session_state.auto_search    = False
 if "map_center"   not in st.session_state: st.session_state.map_center   = None
 
 
@@ -279,15 +280,11 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
         edit_options={"edit": False, "remove": True},
     ).add_to(m)
 
-    # Render active polygon or bounding box
+    # Render bounding box when active (rectangle only — drawn polygon is kept
+    # in the Leaflet.Draw layer, which persists via key="main_map"; adding a
+    # second folium.Polygon overlay causes the map to pulsate/reload).
     _active_poly = st.session_state.get("drawn_polygon", [])
-    if _active_poly:
-        folium.Polygon(
-            locations=_active_poly,
-            color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
-            dash_array="6",
-        ).add_to(m)
-    elif not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
+    if not _active_poly and not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
         folium.Rectangle(
             bounds=[[lat_min, lon_min], [lat_max, lon_max]],
             color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
@@ -403,7 +400,8 @@ if not check_db():
     st.stop()
 
 # ── run search ────────────────────────────────────────────────────────────────
-if search_clicked:
+if search_clicked or st.session_state.get("auto_search"):
+    st.session_state.auto_search = False
     with st.spinner("Searching..."):
         _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
         if st.session_state.get("drawn_polygon"):
@@ -463,6 +461,7 @@ if drawings:
                 if new_poly != st.session_state.get("drawn_polygon"):
                     st.session_state.drawn_polygon = new_poly
                     st.session_state.drawn_bbox    = {}
+                    st.session_state.auto_search   = True
                     st.rerun()
 
 # detect marker click
