@@ -372,16 +372,13 @@ def build_profile_chart(df: pd.DataFrame, op_id: int):
                         horizontal_spacing=0.06)
 
     col = 1
-    # Vertical axis: prefer DEPTH, fall back to PRES, then sample_number
+    # Vertical axis: prefer DEPTH, fall back to PRES
     if "depth" in df.columns and df["depth"].notna().any():
         yaxis = df["depth"]
         yaxis_label = "Depth (m)"
-    elif df["pressure"].notna().any():
+    else:
         yaxis = df["pressure"]
         yaxis_label = "Pressure (dbar)"
-    else:
-        yaxis = df["sample_number"]
-        yaxis_label = "Sample number"
 
     if has_temp:
         fig.add_trace(go.Scatter(
