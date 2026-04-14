@@ -133,6 +133,13 @@ with st.sidebar:
     ])
     platform_filter = st.selectbox("Platform", platforms)
 
+    st.markdown("### Data type")
+    data_type_filter = st.radio(
+        "Include",
+        options=["CTD + BOT", "CTD only", "BOT only"],
+        horizontal=True,
+    )
+
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
@@ -181,7 +188,7 @@ def filter_by_polygon(df: pd.DataFrame, poly: list) -> pd.DataFrame:
 
 
 # ── query ─────────────────────────────────────────────────────────────────────
-def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter=""):
+def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter="", data_type_filter="CTD + BOT"):
     cruise_filter = (cruise_filter or "").strip()
     cruise_active = bool(cruise_filter) and cruise_filter != "— All —"
 
@@ -204,6 +211,15 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
     if cruise_active:
         where_parts.append("m.cruise = ?")
         params.append(cruise_filter)
+
+    if data_type_filter == "CTD only":
+        where_parts.append(
+            "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'CTD')"
+        )
+    elif data_type_filter == "BOT only":
+        where_parts.append(
+            "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'BOT')"
+        )
 
     return con.execute(f"""
         SELECT
@@ -244,6 +260,7 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
         JOIN parameters  p USING (parameter_id)
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id = ?
+          AND i.instrument_type = 'CTD'
         GROUP BY r.sample_number
         ORDER BY pressure NULLS LAST
     """, [operation_id]).df()
@@ -420,7 +437,7 @@ if not check_db():
 # ── run search ────────────────────────────────────────────────────────────────
 if search_clicked:
     with st.spinner("Searching..."):
-        _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter)
+        _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter, data_type_filter)
         if st.session_state.get("drawn_polygon"):
             _results = filter_by_polygon(_results, st.session_state.drawn_polygon)
         st.session_state.results     = _results
