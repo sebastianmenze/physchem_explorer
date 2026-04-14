@@ -136,7 +136,7 @@ with st.sidebar:
     st.markdown("### Data type")
     data_type_filter = st.radio(
         "Include",
-        options=["CTD + BOT", "CTD only", "BOT only"],
+        options=["Profiles and bottle values", "Profiles only", "Bottle values only"],
         horizontal=True,
     )
 
@@ -160,6 +160,7 @@ if _db and not st.session_state.get("drawn_polygon"):
 if "results"      not in st.session_state: st.session_state.results      = pd.DataFrame()
 if "selected_op"  not in st.session_state: st.session_state.selected_op  = None
 if "profile"      not in st.session_state: st.session_state.profile      = pd.DataFrame()
+if "bot_profile"  not in st.session_state: st.session_state.bot_profile  = pd.DataFrame()
 if "last_clicked" not in st.session_state: st.session_state.last_clicked = None
 if "drawn_bbox"   not in st.session_state: st.session_state.drawn_bbox   = {}
 if "drawn_polygon"  not in st.session_state: st.session_state.drawn_polygon  = []
@@ -212,11 +213,11 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
         where_parts.append("m.cruise = ?")
         params.append(cruise_filter)
 
-    if data_type_filter == "CTD only":
+    if data_type_filter == "Profiles only":
         where_parts.append(
             "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'CTD')"
         )
-    elif data_type_filter == "BOT only":
+    elif data_type_filter == "Bottle values only":
         where_parts.append(
             "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'BOT')"
         )
@@ -263,6 +264,27 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
           AND i.instrument_type = 'CTD'
         GROUP BY r.sample_number
         ORDER BY pressure NULLS LAST
+    """, [operation_id]).df()
+
+
+# ── fetch bottle (BOT) discrete samples for one operation ────────────────────
+def fetch_bot_profile(operation_id: int) -> pd.DataFrame:
+    return con.execute("""
+        SELECT
+            r.sample_number,
+            MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
+            MAX(CASE WHEN p.parameter_code = 'DEPTH'         THEN r.value_dec END) AS depth,
+            MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
+            MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
+            MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
+            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
+        FROM readings r
+        JOIN parameters  p USING (parameter_id)
+        JOIN instruments i USING (instrument_id)
+        WHERE i.operation_id = ?
+          AND i.instrument_type = 'BOT'
+        GROUP BY r.sample_number
+        ORDER BY depth NULLS LAST, pressure NULLS LAST
     """, [operation_id]).df()
 
 
@@ -367,17 +389,59 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
 
 
 # ── build T/S profile chart ───────────────────────────────────────────────────
-def build_profile_chart(df: pd.DataFrame, op_id: int):
-    has_temp = df["temperature"].notna().any()
-    has_oxy  = df["oxygen"].notna().any()
+def build_profile_chart(df: pd.DataFrame, op_id: int,
+                        bot_df: pd.DataFrame = None,
+                        mode: str = "Profiles and bottle values"):
+    show_ctd = mode in ("Profiles only", "Profiles and bottle values") \
+               and df is not None and not df.empty
+    show_bot = mode in ("Bottle values only", "Profiles and bottle values") \
+               and bot_df is not None and not bot_df.empty
 
-    # Prefer PSAL_ADJUSTED; fall back to PSAL
-    use_sal_adj = "salinity_adj" in df.columns and df["salinity_adj"].notna().any()
-    sal_col     = "salinity_adj" if use_sal_adj else "salinity"
-    sal_label   = "Salinity adj. (PSU)" if use_sal_adj else "Salinity (PSU)"
-    has_sal     = df[sal_col].notna().any()
+    if not show_ctd and not show_bot:
+        return None
 
-    n_cols  = int(sum([has_temp, has_sal, has_oxy]))
+    # Helper: pick best y-axis column from a dataframe
+    def _yaxis(d):
+        if d is not None and not d.empty:
+            if "depth" in d.columns and d["depth"].notna().any():
+                return d["depth"], "Depth (m)"
+            if "pressure" in d.columns and d["pressure"].notna().any():
+                return d["pressure"], "Pressure (dbar)"
+        return None, None
+
+    yctd, ylabel_ctd = _yaxis(df)    if show_ctd else (None, None)
+    ybot, ylabel_bot = _yaxis(bot_df) if show_bot else (None, None)
+    yaxis_label = ylabel_ctd or ylabel_bot or "Depth (m)"
+
+    # Per-source parameter flags
+    if show_ctd:
+        use_sal_adj_ctd = "salinity_adj" in df.columns and df["salinity_adj"].notna().any()
+        sal_col_ctd   = "salinity_adj" if use_sal_adj_ctd else "salinity"
+        sal_label_ctd = "Salinity adj. (PSU)" if use_sal_adj_ctd else "Salinity (PSU)"
+        has_temp_ctd  = df["temperature"].notna().any()
+        has_sal_ctd   = df[sal_col_ctd].notna().any()
+        has_oxy_ctd   = df["oxygen"].notna().any()
+    else:
+        sal_col_ctd = "salinity"; sal_label_ctd = "Salinity (PSU)"
+        has_temp_ctd = has_sal_ctd = has_oxy_ctd = False
+
+    if show_bot:
+        use_sal_adj_bot = "salinity_adj" in bot_df.columns and bot_df["salinity_adj"].notna().any()
+        sal_col_bot   = "salinity_adj" if use_sal_adj_bot else "salinity"
+        sal_label_bot = "Salinity adj. (PSU)" if use_sal_adj_bot else "Salinity (PSU)"
+        has_temp_bot  = bot_df["temperature"].notna().any()
+        has_sal_bot   = bot_df[sal_col_bot].notna().any()
+        has_oxy_bot   = bot_df["oxygen"].notna().any()
+    else:
+        sal_col_bot = "salinity"; sal_label_bot = "Salinity (PSU)"
+        has_temp_bot = has_sal_bot = has_oxy_bot = False
+
+    has_temp = has_temp_ctd or has_temp_bot
+    has_sal  = has_sal_ctd  or has_sal_bot
+    has_oxy  = has_oxy_ctd  or has_oxy_bot
+    sal_label = sal_label_ctd if has_sal_ctd else sal_label_bot
+
+    n_cols = int(sum([has_temp, has_sal, has_oxy]))
     if n_cols == 0:
         return None
 
@@ -389,40 +453,61 @@ def build_profile_chart(df: pd.DataFrame, op_id: int):
                         horizontal_spacing=0.06)
 
     col = 1
-    # Vertical axis: prefer DEPTH, fall back to PRES
-    if "depth" in df.columns and df["depth"].notna().any():
-        yaxis = df["depth"]
-        yaxis_label = "Depth (m)"
-    else:
-        yaxis = df["pressure"]
-        yaxis_label = "Pressure (dbar)"
+    both = show_ctd and show_bot   # show legend only when mixing two sources
 
     if has_temp:
-        fig.add_trace(go.Scatter(
-            x=df["temperature"], y=yaxis, mode="lines",
-            line=dict(color="#e8453c", width=2), name="Temperature",
-        ), row=1, col=col); col += 1
+        if show_ctd and has_temp_ctd:
+            fig.add_trace(go.Scatter(
+                x=df["temperature"], y=yctd, mode="lines",
+                line=dict(color="#e8453c", width=2),
+                name="Temp (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_temp_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df["temperature"], y=ybot, mode="markers",
+                marker=dict(color="#e8453c", size=7, symbol="circle"),
+                name="Temp (BOT)", showlegend=both,
+            ), row=1, col=col)
+        col += 1
 
     if has_sal:
-        fig.add_trace(go.Scatter(
-            x=df[sal_col], y=yaxis, mode="lines",
-            line=dict(color="#1a73e8", width=2), name=sal_label,
-        ), row=1, col=col); col += 1
+        if show_ctd and has_sal_ctd:
+            fig.add_trace(go.Scatter(
+                x=df[sal_col_ctd], y=yctd, mode="lines",
+                line=dict(color="#1a73e8", width=2),
+                name=f"Sal (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_sal_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df[sal_col_bot], y=ybot, mode="markers",
+                marker=dict(color="#1a73e8", size=7, symbol="circle"),
+                name=f"Sal (BOT)", showlegend=both,
+            ), row=1, col=col)
+        col += 1
 
     if has_oxy:
-        fig.add_trace(go.Scatter(
-            x=df["oxygen"], y=yaxis, mode="lines",
-            line=dict(color="#0f9d58", width=2), name="Oxygen",
-        ), row=1, col=col)
+        if show_ctd and has_oxy_ctd:
+            fig.add_trace(go.Scatter(
+                x=df["oxygen"], y=yctd, mode="lines",
+                line=dict(color="#0f9d58", width=2),
+                name="Oxy (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_oxy_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df["oxygen"], y=ybot, mode="markers",
+                marker=dict(color="#0f9d58", size=7, symbol="circle"),
+                name="Oxy (BOT)", showlegend=both,
+            ), row=1, col=col)
 
     fig.update_yaxes(autorange="reversed", title_text=yaxis_label, row=1, col=1)
     fig.update_layout(
         height=420,
         margin=dict(l=10, r=10, t=40, b=10),
-        showlegend=False,
+        showlegend=both,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(size=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
     fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
@@ -443,6 +528,7 @@ if search_clicked:
         st.session_state.results     = _results
         st.session_state.selected_op = None
         st.session_state.profile     = pd.DataFrame()
+        st.session_state.bot_profile = pd.DataFrame()
         st.session_state.map_center  = None
         st.session_state.map_zoom    = None
 
@@ -511,7 +597,8 @@ if clicked and not df.empty:
             st.session_state.last_clicked = closest_id
             st.session_state.selected_op  = closest_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile = fetch_profile(closest_id)
+                st.session_state.profile     = fetch_profile(closest_id)
+                st.session_state.bot_profile = fetch_bot_profile(closest_id)
             st.rerun()
 
 # ── metadata + profile row (only when an op is selected) ─────────────────────
@@ -550,12 +637,17 @@ if st.session_state.selected_op is not None:
             meta("Chief scientist", r.chief_scientist)
 
     with profile_col:
-        profile = st.session_state.profile
-        if profile.empty:
+        profile     = st.session_state.profile
+        bot_profile = st.session_state.bot_profile
+        _has_ctd = not profile.empty
+        _has_bot = not bot_profile.empty
+        if not _has_ctd and not _has_bot:
             st.caption("No readings found for this operation.")
         else:
             st.markdown("<div class='section-header'>T/S Profile</div>", unsafe_allow_html=True)
-            fig = build_profile_chart(profile, op_id)
+            fig = build_profile_chart(profile, op_id,
+                                      bot_df=bot_profile,
+                                      mode=data_type_filter)
             if fig:
                 st.plotly_chart(fig, width='stretch', config={
                     "displayModeBar": True,
@@ -570,11 +662,18 @@ if st.session_state.selected_op is not None:
             else:
                 st.caption("No TEMP/PSAL/PRES readings found for this operation.")
             with st.expander("Raw profile data"):
-                st.dataframe(
-                    profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
-                    width='stretch',
-                    height=200,
-                )
+                if _has_ctd:
+                    st.caption("CTD")
+                    st.dataframe(
+                        profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
+                        width='stretch', height=200,
+                    )
+                if _has_bot:
+                    st.caption("Bottle values")
+                    st.dataframe(
+                        bot_profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
+                        width='stretch', height=200,
+                    )
 
 
 # ── export: fetch all readings for found operations with full metadata ─────────
@@ -856,7 +955,8 @@ if not df.empty:
             st.session_state.map_center  = [float(tbl_row.lat), float(tbl_row.lon)]
             st.session_state.selected_op = selected_op_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile = fetch_profile(selected_op_id)
+                st.session_state.profile     = fetch_profile(selected_op_id)
+                st.session_state.bot_profile = fetch_bot_profile(selected_op_id)
             st.rerun()
 
 # ── download panel ────────────────────────────────────────────────────────────
