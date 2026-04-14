@@ -788,7 +788,35 @@ def build_export_df(operation_ids: tuple) -> pd.DataFrame:
     return result[[c for c in final_cols if c in result.columns]]
 
 
-def to_netcdf_bytes(export_df: pd.DataFrame) -> bytes:
+@st.cache_data(show_spinner=False)
+def get_param_units(op_ids: tuple) -> dict:
+    """Return {parameter_code: units} for all parameters in the given operations."""
+    ids_sql = ",".join(str(i) for i in op_ids)
+    rows = con.execute(f"""
+        SELECT DISTINCT p.parameter_code, p.units
+        FROM parameters p
+        JOIN instruments i USING (instrument_id)
+        WHERE i.operation_id IN ({ids_sql})
+          AND p.units IS NOT NULL
+          AND p.units != ''
+    """).fetchall()
+    return {code: unit for code, unit in rows if unit and str(unit).strip()}
+
+
+def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
+    """Rename parameter and QC columns to include units, e.g. PRES -> PRES [dbar]."""
+    rename = {}
+    for col in df.columns:
+        if col.endswith("_QC"):
+            param = col[:-3]
+            if param in param_units:
+                rename[col] = f"{col} [{param_units[param]}]"
+        elif col in param_units:
+            rename[col] = f"{col} [{param_units[col]}]"
+    return df.rename(columns=rename) if rename else df
+
+
+def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
     """
     Convert wide-format export DataFrame to compact NetCDF4.
 
@@ -853,13 +881,15 @@ def to_netcdf_bytes(export_df: pd.DataFrame) -> bytes:
 
     for col in param_cols:
         arr = edf[col].to_numpy(dtype=float, na_value=float("nan")).astype(np.float32)
-        data_vars[col]  = ("obs", arr)
-        encoding[col]   = enc_num.copy()
+        attrs = {"units": param_units[col]} if param_units and col in param_units else {}
+        data_vars[col] = xr.Variable("obs", arr, attrs=attrs) if attrs else ("obs", arr)
+        encoding[col]  = enc_num.copy()
         qc_col = f"{col}_QC"
         if qc_col in edf.columns:
             # store QC as single-byte int (0-9); empty/unknown -> -1
             qc_arr = pd.to_numeric(edf[qc_col], errors="coerce").fillna(-1).astype(np.int8)
-            data_vars[qc_col] = ("obs", qc_arr.values)
+            qc_attrs = {"units": param_units[col]} if param_units and col in param_units else {}
+            data_vars[qc_col] = xr.Variable("obs", qc_arr.values, attrs=qc_attrs) if qc_attrs else ("obs", qc_arr.values)
             encoding[qc_col]  = {"dtype": "int8", "zlib": True, "complevel": 6}
 
     # ── profile-dimension variables (metadata) ────────────────────────────────
@@ -1066,13 +1096,14 @@ if not df.empty:
     dl_col1, dl_col2, dl_col3 = st.columns(3)
 
     edf = st.session_state.get(export_key + "_edf")
+    param_units = get_param_units(op_ids)
 
     # ── CSV ───────────────────────────────────────────────────────────────────
     with dl_col1:
         if edf is None:
             st.button("Download CSV", disabled=True, width='stretch')
         elif export_key + "_csv" not in st.session_state:
-            st.session_state[export_key + "_csv"] = edf.to_csv(index=False).encode("utf-8")
+            st.session_state[export_key + "_csv"] = _rename_with_units(edf, param_units).to_csv(index=False).encode("utf-8")
             st.rerun()
         else:
             csv_bytes = st.session_state[export_key + "_csv"]
@@ -1096,7 +1127,7 @@ if not df.empty:
             st.caption(f"Error: {st.session_state[export_key + '_nc_err']}")
         elif export_key + "_nc" not in st.session_state:
             try:
-                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf)
+                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf, param_units=param_units)
             except Exception as e:
                 st.session_state[export_key + "_nc_err"] = str(e)
             st.rerun()
@@ -1117,7 +1148,7 @@ if not df.empty:
         elif export_key + "_xl" not in st.session_state:
             xl_buf = io.BytesIO()
             with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
-                edf.to_excel(writer, sheet_name="Readings", index=False)
+                _rename_with_units(edf, param_units).to_excel(writer, sheet_name="Readings", index=False)
             st.session_state[export_key + "_xl"] = xl_buf.getvalue()
             st.rerun()
         else:
