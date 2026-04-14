@@ -235,6 +235,7 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
         SELECT
             r.sample_number,
             MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
+            MAX(CASE WHEN p.parameter_code = 'DEPTH'         THEN r.value_dec END) AS depth,
             MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
             MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
             MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
@@ -244,7 +245,7 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id = ?
         GROUP BY r.sample_number
-        ORDER BY pressure
+        ORDER BY pressure NULLS LAST
     """, [operation_id]).df()
 
 
@@ -371,27 +372,36 @@ def build_profile_chart(df: pd.DataFrame, op_id: int):
                         horizontal_spacing=0.06)
 
     col = 1
-    pres = df["pressure"] if df["pressure"].notna().any() else df["sample_number"]
+    # Vertical axis: prefer DEPTH, fall back to PRES, then sample_number
+    if "depth" in df.columns and df["depth"].notna().any():
+        yaxis = df["depth"]
+        yaxis_label = "Depth (m)"
+    elif df["pressure"].notna().any():
+        yaxis = df["pressure"]
+        yaxis_label = "Pressure (dbar)"
+    else:
+        yaxis = df["sample_number"]
+        yaxis_label = "Sample number"
 
     if has_temp:
         fig.add_trace(go.Scatter(
-            x=df["temperature"], y=pres, mode="lines",
+            x=df["temperature"], y=yaxis, mode="lines",
             line=dict(color="#e8453c", width=2), name="Temperature",
         ), row=1, col=col); col += 1
 
     if has_sal:
         fig.add_trace(go.Scatter(
-            x=df[sal_col], y=pres, mode="lines",
+            x=df[sal_col], y=yaxis, mode="lines",
             line=dict(color="#1a73e8", width=2), name=sal_label,
         ), row=1, col=col); col += 1
 
     if has_oxy:
         fig.add_trace(go.Scatter(
-            x=df["oxygen"], y=pres, mode="lines",
+            x=df["oxygen"], y=yaxis, mode="lines",
             line=dict(color="#0f9d58", width=2), name="Oxygen",
         ), row=1, col=col)
 
-    fig.update_yaxes(autorange="reversed", title_text="Pressure (dbar)", row=1, col=1)
+    fig.update_yaxes(autorange="reversed", title_text=yaxis_label, row=1, col=1)
     fig.update_layout(
         height=420,
         margin=dict(l=10, r=10, t=40, b=10),
