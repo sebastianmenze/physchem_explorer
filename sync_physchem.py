@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 from tqdm import tqdm
 
 API_BASE          = "https://physchem-api.hi.no"
-DB_PATH           = "physchem_all.duckdb"
+DB_PATH           = "data/physchem_all.duckdb"
 STOP_AFTER_MISSES = 200   # stop probing after this many consecutive 404s above max ID
 MAX_RETRIES       = 3
 RETRY_DELAY       = 5     # seconds between retries on network/server errors
