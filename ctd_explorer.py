@@ -66,6 +66,23 @@ def check_db():
     return n > 0
 
 
+@st.cache_data(show_spinner=False)
+def get_cruise_dates(cruise: str):
+    """Return (start_date, stop_date) for a cruise as date objects (None if missing)."""
+    row = con.execute("""
+        SELECT MIN(mission_start), MAX(mission_stop)
+        FROM missions WHERE cruise = ?
+    """, [cruise]).fetchone()
+    def _d(v):
+        if v is None:
+            return None
+        try:
+            return pd.Timestamp(v).date()
+        except Exception:
+            return None
+    return _d(row[0]), _d(row[1])
+
+
 # ── sidebar: filters ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🌊 CTD Explorer")
@@ -80,23 +97,67 @@ with st.sidebar:
     cruise_filter = st.selectbox("Cruise number", cruises)
     cruise_active = cruise_filter != "— All —"
 
+    # ── date inputs with auto-extend when cruise window is wider ──────────────
+    _today         = date.today()
+    _default_start = _today - timedelta(days=365)
+    _default_end   = _today
+
+    # Initialise session state keys on first load
+    if "date_start_input" not in st.session_state:
+        st.session_state["date_start_input"] = str(_default_start)
+    if "date_end_input" not in st.session_state:
+        st.session_state["date_end_input"]   = str(_default_end)
+    if "_last_cruise"          not in st.session_state:
+        st.session_state["_last_cruise"]          = "— All —"
+    if "_dates_auto_extended"  not in st.session_state:
+        st.session_state["_dates_auto_extended"]  = False
+
+    # When the cruise selection changes, extend dates if the cruise spans
+    # beyond the current search window
+    if cruise_active and cruise_filter != st.session_state["_last_cruise"]:
+        st.session_state["_last_cruise"] = cruise_filter
+        c_start, c_stop = get_cruise_dates(cruise_filter)
+        try:
+            cur_start = date.fromisoformat(st.session_state["date_start_input"])
+        except Exception:
+            cur_start = _default_start
+        try:
+            cur_end = date.fromisoformat(st.session_state["date_end_input"])
+        except Exception:
+            cur_end = _default_end
+
+        new_start = c_start if (c_start and c_start < cur_start) else cur_start
+        new_end   = c_stop  if (c_stop  and c_stop  > cur_end)   else cur_end
+
+        extended = (new_start != cur_start or new_end != cur_end)
+        if extended:
+            st.session_state["date_start_input"]  = str(new_start)
+            st.session_state["date_end_input"]    = str(new_end)
+        st.session_state["_dates_auto_extended"] = extended
+
+    elif not cruise_active and st.session_state["_last_cruise"] != "— All —":
+        st.session_state["_last_cruise"]         = "— All —"
+        st.session_state["_dates_auto_extended"] = False
+
     st.markdown("### Time range")
-    if cruise_active:
+    if cruise_active and st.session_state.get("_dates_auto_extended"):
+        c_start, c_stop = get_cruise_dates(cruise_filter)
+        st.caption(f"⤢ Extended to cover full cruise ({c_start} – {c_stop})")
+    elif cruise_active:
         st.caption("ℹ️ Combined with area and platform filters if set.")
-    default_end   = date.today()
-    default_start = default_end - timedelta(days=365)
-    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start))
-    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end))
+
+    date_start_str = st.text_input("From (YYYY-MM-DD)", key="date_start_input")
+    date_end_str   = st.text_input("To   (YYYY-MM-DD)", key="date_end_input")
     try:
         date_start = date.fromisoformat(date_start_str.strip())
     except ValueError:
         st.caption("Invalid start date")
-        date_start = default_start
+        date_start = _default_start
     try:
         date_end = date.fromisoformat(date_end_str.strip())
     except ValueError:
         st.caption("Invalid end date")
-        date_end = default_end
+        date_end = _default_end
 
     st.markdown("### Area filter")
     _poly  = st.session_state.get("drawn_polygon", [])
