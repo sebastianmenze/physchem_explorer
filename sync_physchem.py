@@ -34,6 +34,8 @@ import requests
 import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
+import shutil
+import os
 
 API_BASE          = "https://physchem-api.hi.no"
 DB_PATH           = "data/physchem_all.duckdb"
@@ -434,7 +436,10 @@ def main():
     print(f"Active : {args.active_days} day window for Phase 2")
     print(f"Started: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
-    con = duckdb.connect(args.db)
+    newdatabase = 'data/physchem_new.duckdb'
+    dest = shutil.copyfile(args.db, newdatabase)
+
+    con = duckdb.connect(newdatabase)
     init_db(con)
 
     before = row_counts(con)
@@ -459,6 +464,9 @@ def main():
 
     print_summary(con)
     con.close()
+
+    dest = shutil.copyfile(newdatabase,args.db)
+
 
 
 if __name__ == "__main__":
