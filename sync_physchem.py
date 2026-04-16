@@ -436,6 +436,7 @@ def main():
     print(f"Active : {args.active_days} day window for Phase 2")
     print(f"Started: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
+    print('Cloning local DUCK DB')
     newdatabase = 'data/physchem_new.duckdb'
     dest = shutil.copyfile(args.db, newdatabase)
 
