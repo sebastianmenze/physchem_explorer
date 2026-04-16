@@ -82,11 +82,11 @@ with st.sidebar:
 
     st.markdown("### Time range")
     if cruise_active:
-        st.caption("ℹ️ Date filter inactive while a cruise is selected.")
+        st.caption("ℹ️ Combined with area and platform filters if set.")
     default_end   = date.today()
     default_start = default_end - timedelta(days=365)
-    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start), disabled=cruise_active)
-    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end),   disabled=cruise_active)
+    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start))
+    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end))
     try:
         date_start = date.fromisoformat(date_start_str.strip())
     except ValueError:
@@ -194,16 +194,14 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
     cruise_active = bool(cruise_filter) and cruise_filter != "— All —"
 
     where_parts = [
+        "o.time_start      BETWEEN ? AND ?",
         "o.latitude_start  BETWEEN ? AND ?",
         "o.longitude_start BETWEEN ? AND ?",
         "o.latitude_start  IS NOT NULL",
         "o.longitude_start IS NOT NULL",
     ]
-    params = [lat_min, lat_max, lon_min, lon_max]
-
-    if not cruise_active:
-        where_parts.insert(0, "o.time_start BETWEEN ? AND ?")
-        params = [str(date_start) + "T00:00:00", str(date_end) + "T23:59:59"] + params
+    params = [str(date_start) + "T00:00:00", str(date_end) + "T23:59:59",
+              lat_min, lat_max, lon_min, lon_max]
 
     if platform_filter != "All":
         where_parts.append("m.platform_name = ?")
