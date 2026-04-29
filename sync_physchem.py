@@ -437,7 +437,7 @@ def main():
     print(f"Started: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
     print('Cloning local DUCK DB')
-    newdatabase = 'data/physchem_new.duckdb'
+    newdatabase = os.path.join(os.path.dirname(os.path.abspath(args.db)), 'physchem_new.duckdb')
     dest = shutil.copyfile(args.db, newdatabase)
 
     con = duckdb.connect(newdatabase)
