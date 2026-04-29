@@ -2,8 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir \
+# Install curl (needed for healthcheck) and Python dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir \
     streamlit \
     folium \
     streamlit-folium \
@@ -13,7 +15,8 @@ RUN pip install --no-cache-dir \
     numpy \
     openpyxl \
     xarray \
-    h5netcdf
+    h5netcdf \
+    h5py
 
 # Copy app
 COPY ctd_explorer.py .
@@ -21,11 +24,14 @@ COPY ctd_explorer.py .
 EXPOSE 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+    CMD curl -f http://localhost:8501/physchem-explorer/_stcore/health || exit 1
 
 CMD ["python", "-m", "streamlit", "run", "ctd_explorer.py", \
      "--server.port=8501", \
      "--server.address=0.0.0.0", \
      "--server.headless=true", \
      "--server.fileWatcherType=none", \
-     "--server.maxUploadSize=500"]
+     "--server.maxUploadSize=500", \
+     "--server.enableCORS=false", \
+     "--server.enableXsrfProtection=false", \
+     "--server.baseUrlPath=physchem-explorer"]

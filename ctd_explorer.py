@@ -39,7 +39,7 @@ st.set_page_config(
 # ── minimal styling ────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 1rem; }
+    .block-container { padding-top: 3.5rem; padding-bottom: 1rem; }
     .stMetric label { font-size: 0.75rem !important; }
     div[data-testid="stSidebarContent"] { padding-top: 1.5rem; }
     .op-meta-label { font-size: 0.72rem; color: #888; text-transform: uppercase;
@@ -66,41 +66,125 @@ def check_db():
     return n > 0
 
 
+@st.cache_data(show_spinner=False)
+def get_cruise_dates(cruise: str):
+    """Return (start_date, stop_date) for a cruise as date objects (None if missing)."""
+    row = con.execute("""
+        SELECT MIN(mission_start), MAX(mission_stop)
+        FROM missions WHERE cruise = ?
+    """, [cruise]).fetchone()
+    def _d(v):
+        if v is None:
+            return None
+        try:
+            return pd.Timestamp(v).date()
+        except Exception:
+            return None
+    return _d(row[0]), _d(row[1])
+
+
 # ── sidebar: filters ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🌊 CTD Explorer")
     st.markdown("---")
 
+    st.markdown("### Cruise")
+    cruises = ["— All —"] + sorted([
+        r[0] for r in con.execute(
+            "SELECT DISTINCT cruise FROM missions WHERE cruise IS NOT NULL ORDER BY 1"
+        ).fetchall()
+    ])
+    cruise_filter = st.selectbox("Cruise number", cruises)
+    cruise_active = cruise_filter != "— All —"
+
+    # ── date inputs with auto-extend when cruise window is wider ──────────────
+    _today         = date.today()
+    _default_start = _today - timedelta(days=365)
+    _default_end   = _today
+
+    # Initialise session state keys on first load
+    if "date_start_input" not in st.session_state:
+        st.session_state["date_start_input"] = str(_default_start)
+    if "date_end_input" not in st.session_state:
+        st.session_state["date_end_input"]   = str(_default_end)
+    if "_last_cruise"          not in st.session_state:
+        st.session_state["_last_cruise"]          = "— All —"
+    if "_dates_auto_extended"  not in st.session_state:
+        st.session_state["_dates_auto_extended"]  = False
+
+    # When the cruise selection changes, extend dates if the cruise spans
+    # beyond the current search window
+    if cruise_active and cruise_filter != st.session_state["_last_cruise"]:
+        st.session_state["_last_cruise"] = cruise_filter
+        c_start, c_stop = get_cruise_dates(cruise_filter)
+        try:
+            cur_start = date.fromisoformat(st.session_state["date_start_input"])
+        except Exception:
+            cur_start = _default_start
+        try:
+            cur_end = date.fromisoformat(st.session_state["date_end_input"])
+        except Exception:
+            cur_end = _default_end
+
+        new_start = c_start if (c_start and c_start < cur_start) else cur_start
+        new_end   = c_stop  if (c_stop  and c_stop  > cur_end)   else cur_end
+
+        extended = (new_start != cur_start or new_end != cur_end)
+        if extended:
+            st.session_state["date_start_input"]  = str(new_start)
+            st.session_state["date_end_input"]    = str(new_end)
+        st.session_state["_dates_auto_extended"] = extended
+
+    elif not cruise_active and st.session_state["_last_cruise"] != "— All —":
+        st.session_state["_last_cruise"]         = "— All —"
+        st.session_state["_dates_auto_extended"] = False
+
     st.markdown("### Time range")
-    default_end   = date.today()
-    default_start = default_end - timedelta(days=90)
-    date_start_str = st.text_input("From (YYYY-MM-DD)", value=str(default_start))
-    date_end_str   = st.text_input("To   (YYYY-MM-DD)", value=str(default_end))
+    if cruise_active and st.session_state.get("_dates_auto_extended"):
+        c_start, c_stop = get_cruise_dates(cruise_filter)
+        st.caption(f"⤢ Extended to cover full cruise ({c_start} – {c_stop})")
+    elif cruise_active:
+        st.caption("ℹ️ Combined with area and platform filters if set.")
+
+    date_start_str = st.text_input("From (YYYY-MM-DD)", key="date_start_input")
+    date_end_str   = st.text_input("To   (YYYY-MM-DD)", key="date_end_input")
     try:
         date_start = date.fromisoformat(date_start_str.strip())
     except ValueError:
         st.caption("Invalid start date")
-        date_start = default_start
+        date_start = _default_start
     try:
         date_end = date.fromisoformat(date_end_str.strip())
     except ValueError:
         st.caption("Invalid end date")
-        date_end = default_end
+        date_end = _default_end
 
-    st.markdown("### Bounding box")
-    st.caption("Draw a rectangle on the map, or enter coordinates manually")
-    drawn = st.session_state.get("drawn_bbox", {})
-    col1, col2 = st.columns(2)
-    with col1:
-        lat_min = st.number_input("Lat min", value=float(drawn.get("lat_min", -90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
-        lon_min = st.number_input("Lon min", value=float(drawn.get("lon_min", -180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
-    with col2:
-        lat_max = st.number_input("Lat max", value=float(drawn.get("lat_max", 90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
-        lon_max = st.number_input("Lon max", value=float(drawn.get("lon_max", 180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
-    if drawn:
-        if st.button("✕  Clear drawn box", width='stretch'):
-            st.session_state.drawn_bbox = {}
+    st.markdown("### Area filter")
+    _poly  = st.session_state.get("drawn_polygon", [])
+    _drawn = st.session_state.get("drawn_bbox", {})
+    if _poly:
+        st.caption(f"Polygon drawn ({len(_poly)} vertices) — bounding box inputs inactive.")
+        # Derive bbox from polygon for the SQL pre-filter
+        _poly_lats = [p[0] for p in _poly]
+        _poly_lons = [p[1] for p in _poly]
+        lat_min = float(min(_poly_lats));  lat_max = float(max(_poly_lats))
+        lon_min = float(min(_poly_lons));  lon_max = float(max(_poly_lons))
+        if st.button("✕  Clear polygon", width='stretch'):
+            st.session_state.drawn_polygon = []
             st.rerun()
+    else:
+        st.caption("Draw a rectangle or polygon on the map, or enter coordinates manually")
+        col1, col2 = st.columns(2)
+        with col1:
+            lat_min = st.number_input("Lat min", value=float(_drawn.get("lat_min", -90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
+            lon_min = st.number_input("Lon min", value=float(_drawn.get("lon_min", -180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
+        with col2:
+            lat_max = st.number_input("Lat max", value=float(_drawn.get("lat_max", 90.0)), min_value=-90.0, max_value=90.0, step=0.5, format="%.2f")
+            lon_max = st.number_input("Lon max", value=float(_drawn.get("lon_max", 180.0)), min_value=-180.0, max_value=180.0, step=0.5, format="%.2f")
+        if _drawn:
+            if st.button("✕  Clear drawn box", width='stretch'):
+                st.session_state.drawn_bbox = {}
+                st.rerun()
 
     st.markdown("### Platform filter")
     platforms = ["All"] + sorted([
@@ -110,31 +194,92 @@ with st.sidebar:
     ])
     platform_filter = st.selectbox("Platform", platforms)
 
+    st.markdown("### Data type")
+    data_type_filter = st.radio(
+        "Include",
+        options=["Profiles and bottle values", "Profiles only", "Bottle values only"],
+        horizontal=True,
+    )
+
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
+
+
+# Ensure drawn bbox always takes precedence over number input widget state.
+# Streamlit caches widget values between reruns and may ignore a changed
+# value= parameter, causing stale defaults to be used instead of the newly
+# drawn rectangle. Override here so the search always uses the stored shape.
+_db = st.session_state.get("drawn_bbox", {})
+if _db and not st.session_state.get("drawn_polygon"):
+    lat_min = float(_db["lat_min"])
+    lat_max = float(_db["lat_max"])
+    lon_min = float(_db["lon_min"])
+    lon_max = float(_db["lon_max"])
 
 
 # ── session state ─────────────────────────────────────────────────────────────
 if "results"      not in st.session_state: st.session_state.results      = pd.DataFrame()
 if "selected_op"  not in st.session_state: st.session_state.selected_op  = None
 if "profile"      not in st.session_state: st.session_state.profile      = pd.DataFrame()
+if "bot_profile"  not in st.session_state: st.session_state.bot_profile  = pd.DataFrame()
 if "last_clicked" not in st.session_state: st.session_state.last_clicked = None
 if "drawn_bbox"   not in st.session_state: st.session_state.drawn_bbox   = {}
+if "drawn_polygon"  not in st.session_state: st.session_state.drawn_polygon  = []
 if "map_center"   not in st.session_state: st.session_state.map_center   = None
 
 
+# ── polygon point-in-polygon filter (ray-casting, no extra deps) ──────────────
+def _pip(lat: float, lon: float, poly: list) -> bool:
+    """Return True if (lat, lon) is inside the polygon [[lat,lon], ...]."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        yi, xi = poly[i]
+        yj, xj = poly[j]
+        if ((xi > lon) != (xj > lon)) and (lat < (yj - yi) * (lon - xi) / (xj - xi) + yi):
+            inside = not inside
+        j = i
+    return inside
+
+def filter_by_polygon(df: pd.DataFrame, poly: list) -> pd.DataFrame:
+    if not poly or df.empty:
+        return df
+    mask = [_pip(float(row.lat), float(row.lon), poly) for _, row in df.iterrows()]
+    return df[mask].reset_index(drop=True)
+
+
 # ── query ─────────────────────────────────────────────────────────────────────
-def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter):
-    platform_clause = ""
-    params = [
-        str(date_start) + "T00:00:00",
-        str(date_end)   + "T23:59:59",
-        lat_min, lat_max,
-        lon_min, lon_max,
+def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter="", data_type_filter="CTD + BOT"):
+    cruise_filter = (cruise_filter or "").strip()
+    cruise_active = bool(cruise_filter) and cruise_filter != "— All —"
+
+    where_parts = [
+        "o.time_start      BETWEEN ? AND ?",
+        "o.latitude_start  BETWEEN ? AND ?",
+        "o.longitude_start BETWEEN ? AND ?",
+        "o.latitude_start  IS NOT NULL",
+        "o.longitude_start IS NOT NULL",
     ]
+    params = [str(date_start) + "T00:00:00", str(date_end) + "T23:59:59",
+              lat_min, lat_max, lon_min, lon_max]
+
     if platform_filter != "All":
-        platform_clause = "AND m.platform_name = ?"
+        where_parts.append("m.platform_name = ?")
         params.append(platform_filter)
+
+    if cruise_active:
+        where_parts.append("m.cruise = ?")
+        params.append(cruise_filter)
+
+    if data_type_filter == "Profiles only":
+        where_parts.append(
+            "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'CTD')"
+        )
+    elif data_type_filter == "Bottle values only":
+        where_parts.append(
+            "EXISTS (SELECT 1 FROM instruments i WHERE i.operation_id = o.operation_id AND i.instrument_type = 'BOT')"
+        )
 
     return con.execute(f"""
         SELECT
@@ -155,12 +300,7 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
             m.chief_scientist
         FROM operations o
         JOIN missions m USING (mission_id)
-        WHERE o.time_start BETWEEN ? AND ?
-          AND o.latitude_start  BETWEEN ? AND ?
-          AND o.longitude_start BETWEEN ? AND ?
-          AND o.latitude_start  IS NOT NULL
-          AND o.longitude_start IS NOT NULL
-          {platform_clause}
+        WHERE {" AND ".join(where_parts)}
         ORDER BY o.time_start DESC
     """, params).df()
 
@@ -170,16 +310,40 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
     return con.execute("""
         SELECT
             r.sample_number,
-            MAX(CASE WHEN p.parameter_code = 'PRES' THEN r.value_dec END) AS pressure,
-            MAX(CASE WHEN p.parameter_code = 'TEMP' THEN r.value_dec END) AS temperature,
-            MAX(CASE WHEN p.parameter_code = 'PSAL' THEN r.value_dec END) AS salinity,
-            MAX(CASE WHEN p.parameter_code = 'DOXY' THEN r.value_dec END) AS oxygen
+            MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
+            MAX(CASE WHEN p.parameter_code = 'DEPTH'         THEN r.value_dec END) AS depth,
+            MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
+            MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
+            MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
+            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
         FROM readings r
         JOIN parameters  p USING (parameter_id)
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id = ?
+          AND i.instrument_type = 'CTD'
         GROUP BY r.sample_number
-        ORDER BY pressure
+        ORDER BY pressure NULLS LAST
+    """, [operation_id]).df()
+
+
+# ── fetch bottle (BOT) discrete samples for one operation ────────────────────
+def fetch_bot_profile(operation_id: int) -> pd.DataFrame:
+    return con.execute("""
+        SELECT
+            r.sample_number,
+            MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
+            MAX(CASE WHEN p.parameter_code = 'DEPTH'         THEN r.value_dec END) AS depth,
+            MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
+            MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
+            MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
+            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
+        FROM readings r
+        JOIN parameters  p USING (parameter_id)
+        JOIN instruments i USING (instrument_id)
+        WHERE i.operation_id = ?
+          AND i.instrument_type = 'BOT'
+        GROUP BY r.sample_number
+        ORDER BY depth NULLS LAST, pressure NULLS LAST
     """, [operation_id]).df()
 
 
@@ -213,19 +377,24 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
         </script>
     """))
 
-    # Draw toolbar — rectangle only
+    # Draw toolbar — rectangle + polygon
+    _shape_opts = {"color": "#1a73e8", "weight": 2, "fillOpacity": 0.05}
     Draw(
         export=False,
         draw_options={
-            "rectangle": {"shapeOptions": {"color": "#1a73e8", "weight": 2, "fillOpacity": 0.05}},
-            "polyline": False, "polygon": False, "circle": False,
+            "rectangle": {"shapeOptions": _shape_opts},
+            "polygon":   {"shapeOptions": _shape_opts},
+            "polyline": False, "circle": False,
             "marker": False, "circlemarker": False,
         },
         edit_options={"edit": False, "remove": True},
     ).add_to(m)
 
-    # Draw bounding box if not global
-    if not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
+    # Render bounding box when active (rectangle only — drawn polygon is kept
+    # in the Leaflet.Draw layer, which persists via key="main_map"; adding a
+    # second folium.Polygon overlay causes the map to pulsate/reload).
+    _active_poly = st.session_state.get("drawn_polygon", [])
+    if not _active_poly and not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
         folium.Rectangle(
             bounds=[[lat_min, lon_min], [lat_max, lon_max]],
             color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
@@ -279,51 +448,125 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
 
 
 # ── build T/S profile chart ───────────────────────────────────────────────────
-def build_profile_chart(df: pd.DataFrame, op_id: int):
-    has_temp = df["temperature"].notna().any()
-    has_sal  = df["salinity"].notna().any()
-    has_oxy  = df["oxygen"].notna().any()
+def build_profile_chart(df: pd.DataFrame, op_id: int,
+                        bot_df: pd.DataFrame = None,
+                        mode: str = "Profiles and bottle values"):
+    show_ctd = mode in ("Profiles only", "Profiles and bottle values") \
+               and df is not None and not df.empty
+    show_bot = mode in ("Bottle values only", "Profiles and bottle values") \
+               and bot_df is not None and not bot_df.empty
 
-    n_cols  = int(sum([has_temp, has_sal, has_oxy]))
+    if not show_ctd and not show_bot:
+        return None
+
+    # Helper: pick best y-axis column from a dataframe
+    def _yaxis(d):
+        if d is not None and not d.empty:
+            if "depth" in d.columns and d["depth"].notna().any():
+                return d["depth"], "Depth (m)"
+            if "pressure" in d.columns and d["pressure"].notna().any():
+                return d["pressure"], "Pressure (dbar)"
+        return None, None
+
+    yctd, ylabel_ctd = _yaxis(df)    if show_ctd else (None, None)
+    ybot, ylabel_bot = _yaxis(bot_df) if show_bot else (None, None)
+    yaxis_label = ylabel_ctd or ylabel_bot or "Depth (m)"
+
+    # Per-source parameter flags
+    if show_ctd:
+        use_sal_adj_ctd = "salinity_adj" in df.columns and df["salinity_adj"].notna().any()
+        sal_col_ctd   = "salinity_adj" if use_sal_adj_ctd else "salinity"
+        sal_label_ctd = "Salinity adj. (PSU)" if use_sal_adj_ctd else "Salinity (PSU)"
+        has_temp_ctd  = df["temperature"].notna().any()
+        has_sal_ctd   = df[sal_col_ctd].notna().any()
+        has_oxy_ctd   = df["oxygen"].notna().any()
+    else:
+        sal_col_ctd = "salinity"; sal_label_ctd = "Salinity (PSU)"
+        has_temp_ctd = has_sal_ctd = has_oxy_ctd = False
+
+    if show_bot:
+        use_sal_adj_bot = "salinity_adj" in bot_df.columns and bot_df["salinity_adj"].notna().any()
+        sal_col_bot   = "salinity_adj" if use_sal_adj_bot else "salinity"
+        sal_label_bot = "Salinity adj. (PSU)" if use_sal_adj_bot else "Salinity (PSU)"
+        has_temp_bot  = bot_df["temperature"].notna().any()
+        has_sal_bot   = bot_df[sal_col_bot].notna().any()
+        has_oxy_bot   = bot_df["oxygen"].notna().any()
+    else:
+        sal_col_bot = "salinity"; sal_label_bot = "Salinity (PSU)"
+        has_temp_bot = has_sal_bot = has_oxy_bot = False
+
+    has_temp = has_temp_ctd or has_temp_bot
+    has_sal  = has_sal_ctd  or has_sal_bot
+    has_oxy  = has_oxy_ctd  or has_oxy_bot
+    sal_label = sal_label_ctd if has_sal_ctd else sal_label_bot
+
+    n_cols = int(sum([has_temp, has_sal, has_oxy]))
     if n_cols == 0:
         return None
 
     titles = [t for t, h in [("Temperature (°C)", has_temp),
-                               ("Salinity (PSU)",   has_sal),
+                               (sal_label,          has_sal),
                                ("Oxygen",           has_oxy)] if h]
 
     fig = make_subplots(rows=1, cols=n_cols, shared_yaxes=True, subplot_titles=titles,
                         horizontal_spacing=0.06)
 
     col = 1
-    pres = df["pressure"] if df["pressure"].notna().any() else df["sample_number"]
+    both = show_ctd and show_bot   # show legend only when mixing two sources
 
     if has_temp:
-        fig.add_trace(go.Scatter(
-            x=df["temperature"], y=pres, mode="lines",
-            line=dict(color="#e8453c", width=2), name="Temperature",
-        ), row=1, col=col); col += 1
+        if show_ctd and has_temp_ctd:
+            fig.add_trace(go.Scatter(
+                x=df["temperature"], y=yctd, mode="lines",
+                line=dict(color="#e8453c", width=2),
+                name="Temp (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_temp_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df["temperature"], y=ybot, mode="markers",
+                marker=dict(color="#e8453c", size=7, symbol="circle"),
+                name="Temp (BOT)", showlegend=both,
+            ), row=1, col=col)
+        col += 1
 
     if has_sal:
-        fig.add_trace(go.Scatter(
-            x=df["salinity"], y=pres, mode="lines",
-            line=dict(color="#1a73e8", width=2), name="Salinity",
-        ), row=1, col=col); col += 1
+        if show_ctd and has_sal_ctd:
+            fig.add_trace(go.Scatter(
+                x=df[sal_col_ctd], y=yctd, mode="lines",
+                line=dict(color="#1a73e8", width=2),
+                name=f"Sal (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_sal_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df[sal_col_bot], y=ybot, mode="markers",
+                marker=dict(color="#1a73e8", size=7, symbol="circle"),
+                name=f"Sal (BOT)", showlegend=both,
+            ), row=1, col=col)
+        col += 1
 
     if has_oxy:
-        fig.add_trace(go.Scatter(
-            x=df["oxygen"], y=pres, mode="lines",
-            line=dict(color="#0f9d58", width=2), name="Oxygen",
-        ), row=1, col=col)
+        if show_ctd and has_oxy_ctd:
+            fig.add_trace(go.Scatter(
+                x=df["oxygen"], y=yctd, mode="lines",
+                line=dict(color="#0f9d58", width=2),
+                name="Oxy (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_oxy_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df["oxygen"], y=ybot, mode="markers",
+                marker=dict(color="#0f9d58", size=7, symbol="circle"),
+                name="Oxy (BOT)", showlegend=both,
+            ), row=1, col=col)
 
-    fig.update_yaxes(autorange="reversed", title_text="Pressure (dbar)", row=1, col=1)
+    fig.update_yaxes(autorange="reversed", title_text=yaxis_label, row=1, col=1)
     fig.update_layout(
         height=420,
         margin=dict(l=10, r=10, t=40, b=10),
-        showlegend=False,
+        showlegend=both,
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(size=12),
+        legend=dict(orientation="v", yanchor="bottom", y=0, xanchor="right", x=1),
     )
     fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
     fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)")
@@ -338,9 +581,13 @@ if not check_db():
 # ── run search ────────────────────────────────────────────────────────────────
 if search_clicked:
     with st.spinner("Searching..."):
-        st.session_state.results     = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter)
+        _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter, data_type_filter)
+        if st.session_state.get("drawn_polygon"):
+            _results = filter_by_polygon(_results, st.session_state.drawn_polygon)
+        st.session_state.results     = _results
         st.session_state.selected_op = None
         st.session_state.profile     = pd.DataFrame()
+        st.session_state.bot_profile = pd.DataFrame()
         st.session_state.map_center  = None
         st.session_state.map_zoom    = None
 
@@ -366,24 +613,34 @@ map_data = st_folium(
     returned_objects=["last_object_clicked", "all_drawings"],
 )
 
-# handle drawn rectangle
+# handle drawn shapes (rectangle or polygon)
 drawings = (map_data or {}).get("all_drawings")
 if drawings:
     for feature in drawings:
-        geom = feature.get("geometry", {})
+        geom  = feature.get("geometry", {})
+        props = feature.get("properties", {})
         if geom.get("type") == "Polygon":
-            coords = geom["coordinates"][0]
+            coords = geom["coordinates"][0]   # [[lon, lat], ...]
             lons = [c[0] for c in coords]
             lats = [c[1] for c in coords]
-            new_bbox = {
-                "lat_min": round(min(lats), 4),
-                "lat_max": round(max(lats), 4),
-                "lon_min": round(min(lons), 4),
-                "lon_max": round(max(lons), 4),
-            }
-            if new_bbox != st.session_state.get("drawn_bbox"):
-                st.session_state.drawn_bbox = new_bbox
-                st.rerun()
+            if props.get("type") == "rectangle":
+                new_bbox = {
+                    "lat_min": round(min(lats), 4),
+                    "lat_max": round(max(lats), 4),
+                    "lon_min": round(min(lons), 4),
+                    "lon_max": round(max(lons), 4),
+                }
+                if new_bbox != st.session_state.get("drawn_bbox") or st.session_state.get("drawn_polygon"):
+                    st.session_state.drawn_bbox    = new_bbox
+                    st.session_state.drawn_polygon = []
+                    st.rerun()
+            else:
+                # Free polygon — store as [[lat, lon], ...] (drop closing duplicate)
+                new_poly = [[round(c[1], 4), round(c[0], 4)] for c in coords[:-1]]
+                if new_poly != st.session_state.get("drawn_polygon"):
+                    st.session_state.drawn_polygon = new_poly
+                    st.session_state.drawn_bbox    = {}
+                    st.rerun()
 
 # detect marker click
 clicked = (map_data or {}).get("last_object_clicked")
@@ -399,7 +656,8 @@ if clicked and not df.empty:
             st.session_state.last_clicked = closest_id
             st.session_state.selected_op  = closest_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile = fetch_profile(closest_id)
+                st.session_state.profile     = fetch_profile(closest_id)
+                st.session_state.bot_profile = fetch_bot_profile(closest_id)
             st.rerun()
 
 # ── metadata + profile row (only when an op is selected) ─────────────────────
@@ -438,22 +696,43 @@ if st.session_state.selected_op is not None:
             meta("Chief scientist", r.chief_scientist)
 
     with profile_col:
-        profile = st.session_state.profile
-        if profile.empty:
+        profile     = st.session_state.profile
+        bot_profile = st.session_state.bot_profile
+        _has_ctd = not profile.empty
+        _has_bot = not bot_profile.empty
+        if not _has_ctd and not _has_bot:
             st.caption("No readings found for this operation.")
         else:
             st.markdown("<div class='section-header'>T/S Profile</div>", unsafe_allow_html=True)
-            fig = build_profile_chart(profile, op_id)
+            fig = build_profile_chart(profile, op_id,
+                                      bot_df=bot_profile,
+                                      mode=data_type_filter)
             if fig:
-                st.plotly_chart(fig, width='stretch', config={"displayModeBar": False})
+                st.plotly_chart(fig, width='stretch', config={
+                    "displayModeBar": True,
+                    "modeBarButtonsToRemove": [
+                        "autoScale2d", "lasso2d", "select2d",
+                        "toggleSpikelines", "hoverClosestCartesian",
+                        "hoverCompareCartesian",
+                    ],
+                    "modeBarButtonsToAdd": [],
+                    "displaylogo": False,
+                })
             else:
                 st.caption("No TEMP/PSAL/PRES readings found for this operation.")
             with st.expander("Raw profile data"):
-                st.dataframe(
-                    profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
-                    width='stretch',
-                    height=200,
-                )
+                if _has_ctd:
+                    st.caption("CTD")
+                    st.dataframe(
+                        profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
+                        width='stretch', height=200,
+                    )
+                if _has_bot:
+                    st.caption("Bottle values")
+                    st.dataframe(
+                        bot_profile.dropna(how="all", subset=["temperature","salinity","pressure"]).round(4),
+                        width='stretch', height=200,
+                    )
 
 
 # ── export: fetch all readings for found operations with full metadata ─────────
@@ -568,7 +847,35 @@ def build_export_df(operation_ids: tuple) -> pd.DataFrame:
     return result[[c for c in final_cols if c in result.columns]]
 
 
-def to_netcdf_bytes(export_df: pd.DataFrame) -> bytes:
+@st.cache_data(show_spinner=False)
+def get_param_units(op_ids: tuple) -> dict:
+    """Return {parameter_code: units} for all parameters in the given operations."""
+    ids_sql = ",".join(str(i) for i in op_ids)
+    rows = con.execute(f"""
+        SELECT DISTINCT p.parameter_code, p.units
+        FROM parameters p
+        JOIN instruments i USING (instrument_id)
+        WHERE i.operation_id IN ({ids_sql})
+          AND p.units IS NOT NULL
+          AND p.units != ''
+    """).fetchall()
+    return {code: unit for code, unit in rows if unit and str(unit).strip()}
+
+
+def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
+    """Rename parameter and QC columns to include units, e.g. PRES -> PRES [dbar]."""
+    rename = {}
+    for col in df.columns:
+        if col.endswith("_QC"):
+            param = col[:-3]
+            if param in param_units:
+                rename[col] = f"{col} [{param_units[param]}]"
+        elif col in param_units:
+            rename[col] = f"{col} [{param_units[col]}]"
+    return df.rename(columns=rename) if rename else df
+
+
+def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
     """
     Convert wide-format export DataFrame to compact NetCDF4.
 
@@ -633,13 +940,15 @@ def to_netcdf_bytes(export_df: pd.DataFrame) -> bytes:
 
     for col in param_cols:
         arr = edf[col].to_numpy(dtype=float, na_value=float("nan")).astype(np.float32)
-        data_vars[col]  = ("obs", arr)
-        encoding[col]   = enc_num.copy()
+        attrs = {"units": param_units[col]} if param_units and col in param_units else {}
+        data_vars[col] = xr.Variable("obs", arr, attrs=attrs) if attrs else ("obs", arr)
+        encoding[col]  = enc_num.copy()
         qc_col = f"{col}_QC"
         if qc_col in edf.columns:
             # store QC as single-byte int (0-9); empty/unknown -> -1
             qc_arr = pd.to_numeric(edf[qc_col], errors="coerce").fillna(-1).astype(np.int8)
-            data_vars[qc_col] = ("obs", qc_arr.values)
+            qc_attrs = {"units": param_units[col]} if param_units and col in param_units else {}
+            data_vars[qc_col] = xr.Variable("obs", qc_arr.values, attrs=qc_attrs) if qc_attrs else ("obs", qc_arr.values)
             encoding[qc_col]  = {"dtype": "int8", "zlib": True, "complevel": 6}
 
     # ── profile-dimension variables (metadata) ────────────────────────────────
@@ -735,7 +1044,8 @@ if not df.empty:
             st.session_state.map_center  = [float(tbl_row.lat), float(tbl_row.lon)]
             st.session_state.selected_op = selected_op_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile = fetch_profile(selected_op_id)
+                st.session_state.profile     = fetch_profile(selected_op_id)
+                st.session_state.bot_profile = fetch_bot_profile(selected_op_id)
             st.rerun()
 
 # ── download panel ────────────────────────────────────────────────────────────
@@ -759,8 +1069,13 @@ if not df.empty:
     n_readings = get_reading_count(op_ids)
 
     # ── size estimates (before preparation) ───────────────────────────────────
-    # Assumptions: ~5 param cols + ~25 metadata cols, 8 bytes/cell for CSV,
-    # Excel ~55% of CSV, NetCDF ~25% of CSV (binary + compression)
+    # Wide-format pivot means many NaN cells (only params present in each op
+    # are non-null). Model accounts for sparsity:
+    #   Metadata cols (~23): text, mostly non-null, ~10 bytes/cell
+    #   Param value cells:   fill_rate * 6 bytes + (1-fill_rate) * 1 byte
+    #   QC flag cells:       fill_rate * 2 bytes + (1-fill_rate) * 1 byte
+    # Excel: xlsx zipped XML, ~25% of CSV for sparse numeric data
+    # NetCDF: float32 + zlib6, ~10% of CSV
     n_ops      = len(df)
     n_param_est = con.execute(f"""
         SELECT COUNT(DISTINCT p.parameter_code)
@@ -768,7 +1083,6 @@ if not df.empty:
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id IN ({",".join(str(i) for i in op_ids)})
     """).fetchone()[0] or 5
-    n_cols_est  = n_param_est * 2 + 25   # params + QC flags + metadata
     # pivoted rows ~ unique (operation_id, sample_number) combos
     n_rows_est  = con.execute(f"""
         SELECT COUNT(DISTINCT i.operation_id || '_' || r.sample_number)
@@ -778,38 +1092,39 @@ if not df.empty:
         WHERE i.operation_id IN ({",".join(str(i) for i in op_ids)})
     """).fetchone()[0] or n_readings
 
-    bytes_per_cell_csv = 8
-    # CSV: text, ~8 chars/cell average
-    # Excel: xlsx is zipped XML — roughly 40% of CSV for numeric-heavy data
-    # NetCDF: float32 + zlib6, roughly 15% of CSV
-    csv_est   = n_rows_est * n_cols_est * 8
-    excel_est = int(csv_est * 0.40)
-    nc_est    = int(csv_est * 0.15)
+    _META_COLS  = 23
+    _FILL       = 0.55   # fraction of param/QC cells that are non-null
+    _meta_bpr   = _META_COLS * 10
+    _param_bpr  = n_param_est * (_FILL * 6 + (1 - _FILL) * 1)
+    _qc_bpr     = n_param_est * (_FILL * 2 + (1 - _FILL) * 1)
+    csv_est   = int(n_rows_est * (_meta_bpr + _param_bpr + _qc_bpr))
+    excel_est = int(csv_est * 0.90)   # xlsx ≈ CSV size: XML verbosity offsets zip compression
+    nc_est    = int(csv_est * 0.10)
 
     def fmt_size(b):
         if b < 1024:       return f"{b} B"
         elif b < 1024**2:  return f"{b/1024:.0f} KB"
         else:              return f"{b/1024**2:.1f} MB"
 
-    st.caption(f"{n_ops:,} operations · ~{n_rows_est:,} rows · ~{n_param_est} parameters")
+    st.caption(f"{n_ops:,} operations · ~{n_rows_est:,} rows · ~{n_param_est} parameters  ·  file sizes are estimates")
 
     size_c1, size_c2, size_c3, size_c4 = st.columns(4)
-    size_c1.metric("Estimated rows", f"{n_rows_est:,}")
-    size_c2.metric("CSV",            fmt_size(csv_est))
-    size_c3.metric("NetCDF",         fmt_size(nc_est))
-    size_c4.metric("Excel",          fmt_size(excel_est))
+    size_c1.metric("Rows (est.)",    f"~{n_rows_est:,}")
+    size_c2.metric("CSV (est.)",     f"~{fmt_size(csv_est)}")
+    size_c3.metric("NetCDF (est.)",  f"~{fmt_size(nc_est)}")
+    size_c4.metric("Excel (est.)",   f"~{fmt_size(excel_est)}")
 
     _limit = 500 * 1024 * 1024  # 500 MB
     if csv_est > _limit:
         st.warning(
-            f"The estimated CSV size is **{fmt_size(csv_est)}**, which is large and may be slow to "
+            f"The estimated CSV size is **~{fmt_size(csv_est)}**, which is large and may be slow to "
             f"generate and download. Consider reducing your selection by: "
             f"narrowing the **date range**, drawing a smaller **bounding box** on the map, "
             f"or filtering by a specific **platform**."
         )
     elif excel_est > _limit:
         st.warning(
-            f"The estimated Excel size is **{fmt_size(excel_est)}**. "
+            f"The estimated Excel size is **~{fmt_size(excel_est)}**. "
             f"Excel handles large files poorly — consider using CSV or NetCDF instead, "
             f"or reduce the selection."
         )
@@ -840,15 +1155,14 @@ if not df.empty:
     dl_col1, dl_col2, dl_col3 = st.columns(3)
 
     edf = st.session_state.get(export_key + "_edf")
+    param_units = get_param_units(op_ids)
 
     # ── CSV ───────────────────────────────────────────────────────────────────
     with dl_col1:
         if edf is None:
-            st.button("CSV — preparing...", disabled=True, width='stretch')
+            st.button("Download CSV", disabled=True, width='stretch')
         elif export_key + "_csv" not in st.session_state:
-            # Build CSV now and rerun to show NetCDF spinner
-            with st.spinner("Building CSV..."):
-                st.session_state[export_key + "_csv"] = edf.to_csv(index=False).encode("utf-8")
+            st.session_state[export_key + "_csv"] = _rename_with_units(edf, param_units).to_csv(index=False).encode("utf-8")
             st.rerun()
         else:
             csv_bytes = st.session_state[export_key + "_csv"]
@@ -866,16 +1180,15 @@ if not df.empty:
             st.button("Download NetCDF", disabled=True, width='stretch')
             st.caption(f"Run: `pip install {' '.join(_nc_missing)}`")
         elif edf is None or export_key + "_csv" not in st.session_state:
-            st.button("NetCDF — waiting...", disabled=True, width='stretch')
+            st.button("Download NetCDF", disabled=True, width='stretch')
         elif export_key + "_nc_err" in st.session_state:
             st.button("Download NetCDF", disabled=True, width='stretch')
             st.caption(f"Error: {st.session_state[export_key + '_nc_err']}")
         elif export_key + "_nc" not in st.session_state:
-            with st.spinner("Building NetCDF..."):
-                try:
-                    st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf)
-                except Exception as e:
-                    st.session_state[export_key + "_nc_err"] = str(e)
+            try:
+                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf, param_units=param_units)
+            except Exception as e:
+                st.session_state[export_key + "_nc_err"] = str(e)
             st.rerun()
         else:
             nc_bytes = st.session_state[export_key + "_nc"]
@@ -889,14 +1202,13 @@ if not df.empty:
 
     # ── Excel ─────────────────────────────────────────────────────────────────
     with dl_col3:
-        if edf is None or export_key + "_nc" not in st.session_state and export_key + "_nc_err" not in st.session_state:
-            st.button("Excel — waiting...", disabled=True, width='stretch')
+        if edf is None or (export_key + "_nc" not in st.session_state and export_key + "_nc_err" not in st.session_state):
+            st.button("Download Excel", disabled=True, width='stretch')
         elif export_key + "_xl" not in st.session_state:
-            with st.spinner("Building Excel..."):
-                xl_buf = io.BytesIO()
-                with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
-                    edf.to_excel(writer, sheet_name="Readings", index=False)
-                st.session_state[export_key + "_xl"] = xl_buf.getvalue()
+            xl_buf = io.BytesIO()
+            with pd.ExcelWriter(xl_buf, engine="openpyxl") as writer:
+                _rename_with_units(edf, param_units).to_excel(writer, sheet_name="Readings", index=False)
+            st.session_state[export_key + "_xl"] = xl_buf.getvalue()
             st.rerun()
         else:
             xl_bytes = st.session_state[export_key + "_xl"]
