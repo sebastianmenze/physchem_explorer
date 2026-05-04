@@ -34,7 +34,6 @@ import requests
 import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
-import shutil
 import os
 
 API_BASE          = "https://physchem-api.hi.no"
@@ -466,7 +465,11 @@ def main():
     print_summary(con)
     con.close()
 
-    dest = shutil.copyfile(newdatabase,args.db)
+    # Atomic rename: replaces the live DB in one syscall so readers never see
+    # a partially-written file.  os.replace() requires both paths on the same
+    # filesystem (guaranteed here since newdatabase sits next to args.db).
+    os.replace(newdatabase, args.db)
+    print(f"Swapped {newdatabase} -> {args.db}")
 
 
 
