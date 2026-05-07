@@ -35,6 +35,7 @@ import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
 import os
+import shutil
 
 API_BASE          = "https://physchem-api.hi.no"
 DB_PATH           = "data/physchem_all.duckdb"
