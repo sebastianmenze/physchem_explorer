@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends cron \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir requests duckdb tqdm
+
+COPY sync_physchem.py .
+COPY entrypoint-sync.sh .
+RUN chmod +x entrypoint-sync.sh
+
+CMD ["/app/entrypoint-sync.sh"]

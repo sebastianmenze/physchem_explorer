@@ -51,12 +51,26 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── DB connection (cached) ────────────────────────────────────────────────────
+# ── DB connection (cached, reconnects automatically after a sync swap) ────────
+_db_mtime: float = 0.0
+
+def _maybe_reconnect():
+    """Clear the connection cache when the DB file is replaced by the sync job."""
+    global _db_mtime
+    try:
+        mtime = os.path.getmtime(DB_PATH)
+    except OSError:
+        return
+    if mtime != _db_mtime:
+        _db_mtime = mtime
+        get_con.clear()
+
 @st.cache_resource
 def get_con():
     return duckdb.connect(DB_PATH, read_only=True)
 
 
+_maybe_reconnect()
 con = get_con()
 
 

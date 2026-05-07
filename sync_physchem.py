@@ -34,8 +34,8 @@ import requests
 import time
 from datetime import datetime, timedelta
 from tqdm import tqdm
-import shutil
 import os
+import shutil
 
 API_BASE          = "https://physchem-api.hi.no"
 DB_PATH           = "data/physchem_all.duckdb"
@@ -437,7 +437,7 @@ def main():
     print(f"Started: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
 
     print('Cloning local DUCK DB')
-    newdatabase = 'data/physchem_new.duckdb'
+    newdatabase = os.path.join(os.path.dirname(os.path.abspath(args.db)), 'physchem_new.duckdb')
     dest = shutil.copyfile(args.db, newdatabase)
 
     con = duckdb.connect(newdatabase)
@@ -466,7 +466,11 @@ def main():
     print_summary(con)
     con.close()
 
-    dest = shutil.copyfile(newdatabase,args.db)
+    # Atomic rename: replaces the live DB in one syscall so readers never see
+    # a partially-written file.  os.replace() requires both paths on the same
+    # filesystem (guaranteed here since newdatabase sits next to args.db).
+    os.replace(newdatabase, args.db)
+    print(f"Swapped {newdatabase} -> {args.db}")
 
 
 

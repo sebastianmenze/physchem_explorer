@@ -17,6 +17,19 @@ services:
       timeout: 10s
       retries: 3
 
+  sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.sync
+    restart: unless-stopped
+    volumes:
+      - ./data:/data:rw          # needs write access; streamlit uses :ro
+    environment:
+      - DB_PATH=/data/physchem_all.duckdb
+      - SYNC_SCHEDULE=0 2 * * *  # daily at 02:00 UTC — edit to taste
+      - SYNC_ACTIVE_DAYS=365     # how far back to re-check active missions
+      - SYNC_ON_START=false      # set to "true" to run a sync when container starts
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped
