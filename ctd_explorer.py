@@ -907,9 +907,9 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
     p  = p.dropna("obs", how="all")                # drop empty trailing obs
     df = p.to_dataframe().reset_index()            # flat table
 
-    # Filter CTD only:  instrument_type == 1
-    # Filter BOT only:  instrument_type == 2
-    ctd = ds.where(ds.instrument_type == 1)
+    # Filter CTD only:  instrument_type == "CTD"
+    # Filter BOT only:  instrument_type == "BOT"
+    ctd = ds.where(ds.instrument_type == "CTD")
 
     Profile metadata (lat, lon, time_start …) lives on the profile dimension.
     Measurement data (PRES, TEMP, PSAL …) and instrument_type live on profile × obs.
@@ -971,18 +971,12 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
         data_vars["value_datetime_epoch"] = (["profile", "obs"], dt_2d)
         encoding["value_datetime_epoch"]  = enc_f64.copy()
 
-    # instrument_type: 0=unknown, 1=CTD, 2=BOT
+    # instrument_type: "CTD", "BOT", or "" (empty = unknown/missing)
     if "instrument_type" in edf.columns:
-        itype_map = {"CTD": 1, "BOT": 2}
-        itype_1d  = edf["instrument_type"].map(itype_map).fillna(0).astype(np.int8)
-        itype_2d  = np.zeros((n_profiles, max_obs), dtype=np.int8)
-        itype_2d[profile_pos, obs_pos] = itype_1d.values
-        data_vars["instrument_type"] = xr.Variable(
-            ["profile", "obs"], itype_2d,
-            attrs={"flag_values": np.array([0, 1, 2], dtype=np.int8),
-                   "flag_meanings": "unknown CTD BOT"},
-        )
-        encoding["instrument_type"] = enc_i8.copy()
+        itype_2d = np.full((n_profiles, max_obs), "", dtype="U3")
+        itype_2d[profile_pos, obs_pos] = edf["instrument_type"].fillna("").astype(str).values
+        data_vars["instrument_type"] = (["profile", "obs"], itype_2d)
+        encoding["instrument_type"]  = enc_str.copy()
 
     for col in param_cols:
         attrs  = {"units": param_units[col]} if param_units and col in param_units else {}
@@ -1046,8 +1040,8 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
             "comment":     (
                 "Layout: profile x obs (obs = sample index within profile, 0=shallowest, NaN-padded). "
                 "Extract one profile: ds.isel(profile=i).dropna('obs', how='all'). "
-                "instrument_type: 1=CTD, 2=BOT, 0=unknown. "
-                "Filter CTD: ds.where(ds.instrument_type==1). "
+                "instrument_type: 'CTD', 'BOT', or '' (empty=unknown). "
+                "Filter CTD: ds.where(ds.instrument_type=='CTD'). "
                 "Profile metadata (lat, lon, time_start_epoch ...) is on the profile dimension."
             ),
         }
