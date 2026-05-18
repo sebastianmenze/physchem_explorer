@@ -1043,9 +1043,9 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
             "comment":     (
                 "Layout: profile x obs (obs = sample index within profile, 0=shallowest, NaN-padded). "
                 "Each (operation_id, instrument_type) pair is one profile. "
-                "Extract one profile: ds.isel(profile=i).dropna('obs', how='all'). "
-                "instrument_type: 'CTD', 'BOT', or '' (empty=unknown). "
-                "Filter CTD profiles: ds.where(ds.instrument_type=='CTD', drop=True). "
+                "Drop fill rows: p = ds.isel(profile=i, obs=(ds.isel(profile=i).sample_number.values != -9999)). "
+                "instrument_type: 'CTD', 'BOT', or '' (empty=unknown); 1D on profile dimension. "
+                "Filter CTD profiles: ds.isel(profile=(ds.instrument_type=='CTD').values). "
                 "Profile metadata (lat, lon, time_start_epoch ...) is on the profile dimension."
             ),
         }
