@@ -892,16 +892,23 @@ def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
 
 def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
     """
-    Convert wide-format export DataFrame to compact NetCDF4.
+    Convert wide-format export DataFrame to NetCDF4 with a 2D (profile × depth) layout.
 
-    Structure: flat 1D dimension "obs" (one element per row, like the CSV).
-    Each profile is a group of obs rows sharing the same operation_id.
-    This avoids the sparse 2D (operation x sample_number) matrix that caused
-    the 445 MB file — no padding NaNs, no empty cells.
+    Dimensions
+    ----------
+    profile  — one element per operation (station)
+    depth    — sample index within a profile (0 = shallowest); NaN-padded for
+               profiles shorter than the longest one
 
-    Numeric variables use float32 (halves size vs float64) + zlib compression.
-    String metadata stored as per-operation 1D variables on a separate
-    "profile" dimension, linked via a profile_index coordinate on obs.
+    Usage (Python / xarray)
+    -----------------------
+    ds = xr.open_dataset("physchem_export.nc")
+    p  = ds.isel(profile=0)                        # one profile
+    p  = p.dropna("depth", how="all")              # drop empty trailing depths
+    df = p.to_dataframe().reset_index()            # flat table
+
+    Profile metadata (lat, lon, time_start …) lives on the profile dimension.
+    Measurement data (PRES, TEMP, PSAL …) lives on profile × depth.
     """
     import xarray as xr
     import numpy as np
@@ -917,101 +924,113 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
     param_cols = [c for c in export_df.columns
                   if c not in non_param_cols and not c.endswith("_QC")]
 
-    # Sort so profiles are contiguous
+    # Sort so each profile's samples are in ascending order
     edf = export_df.sort_values(["operation_id", "sample_number"]).reset_index(drop=True)
 
-    # Profile-level index
-    op_ids_1d   = edf["operation_id"].values.astype(np.int64)
-    unique_ops  = pd.unique(edf["operation_id"])          # order-preserving
-    op_to_idx   = {op: i for i, op in enumerate(unique_ops)}
-    profile_idx = np.array([op_to_idx[o] for o in op_ids_1d], dtype=np.int32)
-    n_obs       = len(edf)
+    unique_ops  = pd.unique(edf["operation_id"])
     n_profiles  = len(unique_ops)
+    op_to_idx   = {op: i for i, op in enumerate(unique_ops)}
 
-    # compression settings applied to every numeric variable
-    enc_num = {"dtype": "float32", "zlib": True, "complevel": 6, "_FillValue": -9999.0}
+    # 0-based position of each row within its profile → depth index
+    profile_pos = np.array([op_to_idx[o] for o in edf["operation_id"]], dtype=np.intp)
+    depth_pos   = edf.groupby("operation_id", sort=False).cumcount().values.astype(np.intp)
+    max_depth   = int(depth_pos.max()) + 1
+
+    enc_f32 = {"dtype": "float32", "zlib": True, "complevel": 6, "_FillValue": -9999.0}
+    enc_f64 = {"dtype": "float64", "zlib": True, "complevel": 6}
+    enc_i8  = {"dtype": "int8",    "zlib": True, "complevel": 6}
+    enc_i32 = {"dtype": "int32",   "zlib": True, "complevel": 6}
+    enc_i64 = {"dtype": "int64",   "zlib": True, "complevel": 6}
     enc_str = {"zlib": True, "complevel": 6}
-    enc_int = {"dtype": "int32",   "zlib": True, "complevel": 6}
 
-    encoding  = {}
     data_vars = {}
+    encoding  = {}
 
-    # ── obs-dimension variables ───────────────────────────────────────────────
-    data_vars["profile_index"] = ("obs", profile_idx)
-    encoding["profile_index"]  = enc_int.copy()
+    # helper: scatter a 1D series into a (n_profiles × max_depth) float32 array
+    def _2d_f32(series):
+        arr = np.full((n_profiles, max_depth), np.nan, dtype=np.float32)
+        arr[profile_pos, depth_pos] = series.to_numpy(dtype=float, na_value=np.nan).astype(np.float32)
+        return arr
 
-    data_vars["sample_number"] = ("obs", edf["sample_number"].to_numpy(dtype=np.int32, na_value=-9999))
-    encoding["sample_number"]  = enc_int.copy()
+    # ── profile × depth variables ─────────────────────────────────────────────
+    snum = np.full((n_profiles, max_depth), -9999, dtype=np.int32)
+    snum[profile_pos, depth_pos] = edf["sample_number"].to_numpy(dtype=np.int32, na_value=-9999)
+    data_vars["sample_number"] = (["profile", "depth"], snum)
+    encoding["sample_number"]  = enc_i32.copy()
 
     if "value_datetime" in edf.columns:
-        # store as seconds since epoch (compact int)
-        dt_vals = pd.to_datetime(edf["value_datetime"], errors="coerce")
         epoch   = pd.Timestamp("1970-01-01")
-        secs    = ((dt_vals - epoch).dt.total_seconds()
-                   .to_numpy(dtype=float, na_value=float("nan"))
-                   .astype(np.float64))
-        data_vars["value_datetime_epoch"] = ("obs", secs)
-        encoding["value_datetime_epoch"]  = {"dtype": "float64", "zlib": True, "complevel": 6}
+        secs    = ((pd.to_datetime(edf["value_datetime"], errors="coerce") - epoch)
+                   .dt.total_seconds().to_numpy(dtype=float, na_value=np.nan).astype(np.float64))
+        dt_2d   = np.full((n_profiles, max_depth), np.nan, dtype=np.float64)
+        dt_2d[profile_pos, depth_pos] = secs
+        data_vars["value_datetime_epoch"] = (["profile", "depth"], dt_2d)
+        encoding["value_datetime_epoch"]  = enc_f64.copy()
 
     for col in param_cols:
-        arr = edf[col].to_numpy(dtype=float, na_value=float("nan")).astype(np.float32)
-        attrs = {"units": param_units[col]} if param_units and col in param_units else {}
-        data_vars[col] = xr.Variable("obs", arr, attrs=attrs) if attrs else ("obs", arr)
-        encoding[col]  = enc_num.copy()
+        attrs  = {"units": param_units[col]} if param_units and col in param_units else {}
+        arr2d  = _2d_f32(edf[col])
+        data_vars[col] = xr.Variable(["profile", "depth"], arr2d, attrs=attrs) if attrs else (["profile", "depth"], arr2d)
+        encoding[col]  = enc_f32.copy()
+
         qc_col = f"{col}_QC"
         if qc_col in edf.columns:
-            # store QC as single-byte int (0-9); empty/unknown -> -1
-            qc_arr = pd.to_numeric(edf[qc_col], errors="coerce").fillna(-1).astype(np.int8)
+            qc_num  = pd.to_numeric(edf[qc_col], errors="coerce").to_numpy(dtype=float)
+            qc_2d   = np.full((n_profiles, max_depth), -1, dtype=np.int8)
+            valid   = ~np.isnan(qc_num)
+            qc_2d[profile_pos[valid], depth_pos[valid]] = qc_num[valid].astype(np.int8)
             qc_attrs = {"units": param_units[col]} if param_units and col in param_units else {}
-            data_vars[qc_col] = xr.Variable("obs", qc_arr.values, attrs=qc_attrs) if qc_attrs else ("obs", qc_arr.values)
-            encoding[qc_col]  = {"dtype": "int8", "zlib": True, "complevel": 6}
+            data_vars[qc_col] = xr.Variable(["profile", "depth"], qc_2d, attrs=qc_attrs) if qc_attrs else (["profile", "depth"], qc_2d)
+            encoding[qc_col]  = enc_i8.copy()
 
-    # ── profile-dimension variables (metadata) ────────────────────────────────
-    meta_num = {"latitude_start": np.float32, "longitude_start": np.float32,
-                "bottom_depth_m": np.float32}
-    meta_str = ["platform_name", "cruise", "operation_type", "mission_name",
-                "chief_scientist", "operation_number"]
+    # ── profile-dimension metadata (1D) ───────────────────────────────────────
+    meta_num  = {"latitude_start": np.float32, "longitude_start": np.float32,
+                 "bottom_depth_m": np.float32}
+    meta_str  = ["platform_name", "cruise", "operation_type", "mission_name",
+                 "chief_scientist", "operation_number"]
     meta_time = ["time_start", "time_end"]
 
     op_meta = (edf[["operation_id"] +
-                   [c for c in list(meta_num) + meta_str + meta_time
-                    if c in edf.columns]]
+                   [c for c in list(meta_num) + meta_str + meta_time if c in edf.columns]]
                .drop_duplicates("operation_id")
                .set_index("operation_id")
                .reindex(unique_ops))
 
     data_vars["operation_id"] = ("profile", unique_ops.astype(np.int64))
-    encoding["operation_id"]  = {"dtype": "int64", "zlib": True, "complevel": 6}
+    encoding["operation_id"]  = enc_i64.copy()
 
     for col, dtype in meta_num.items():
         if col in op_meta.columns:
-            data_vars[col] = ("profile", op_meta[col].to_numpy(dtype=float, na_value=float("nan")).astype(dtype))
+            data_vars[col] = ("profile", op_meta[col].to_numpy(dtype=float, na_value=np.nan).astype(dtype))
             encoding[col]  = {"dtype": str(dtype().dtype), "zlib": True, "complevel": 6, "_FillValue": -9999.0}
 
     for col in meta_str:
         if col in op_meta.columns:
-            arr = op_meta[col].fillna("").astype(str).values.astype("U")
-            data_vars[col] = ("profile", arr)
+            data_vars[col] = ("profile", op_meta[col].fillna("").astype(str).values.astype("U"))
             encoding[col]  = enc_str.copy()
 
     for col in meta_time:
         if col in op_meta.columns:
-            dt  = pd.to_datetime(op_meta[col], errors="coerce")
-            secs = ((dt - pd.Timestamp("1970-01-01")).dt.total_seconds()
-                    .to_numpy(dtype=float, na_value=float("nan")).astype(np.float64))
+            secs = ((pd.to_datetime(op_meta[col], errors="coerce") - pd.Timestamp("1970-01-01"))
+                    .dt.total_seconds().to_numpy(dtype=float, na_value=np.nan).astype(np.float64))
             data_vars[f"{col}_epoch"] = ("profile", secs)
-            encoding[f"{col}_epoch"]  = {"dtype": "float64", "zlib": True, "complevel": 6}
+            encoding[f"{col}_epoch"]  = enc_f64.copy()
 
     ds = xr.Dataset(
         data_vars,
-        coords={"obs": np.arange(n_obs, dtype=np.int64),
-                "profile": np.arange(n_profiles, dtype=np.int32)},
+        coords={"profile": np.arange(n_profiles, dtype=np.int32),
+                "depth":   np.arange(max_depth,   dtype=np.int32)},
         attrs={
             "Conventions": "CF-1.8",
             "featureType": "profile",
-            "n_profiles": n_profiles,
-            "n_obs": n_obs,
-            "history": f"Exported from Physchem CTD Explorer",
+            "n_profiles":  n_profiles,
+            "max_depth_levels": max_depth,
+            "history":     "Exported from Physchem CTD Explorer",
+            "comment":     (
+                "Layout: profile x depth (depth = sample index, 0=shallowest, NaN-padded). "
+                "Extract one profile: ds.isel(profile=i).dropna('depth', how='all'). "
+                "Profile metadata (lat, lon, time_start_epoch ...) is on the profile dimension."
+            ),
         }
     )
 
