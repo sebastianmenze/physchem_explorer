@@ -55,7 +55,7 @@ st.markdown("""
 _db_mtime: float = 0.0
 
 def _maybe_reconnect():
-    """Clear the connection cache when the DB file is replaced by the sync job."""
+    """Reconnect when the DB file is replaced by the sync job."""
     global _db_mtime
     try:
         mtime = os.path.getmtime(DB_PATH)
@@ -64,8 +64,9 @@ def _maybe_reconnect():
     if mtime != _db_mtime:
         _db_mtime = mtime
         get_con.clear()
+        st.cache_data.clear()   # also flush stale query/cruise/unit caches
 
-@st.cache_resource
+@st.cache_resource(ttl=3600)   # reconnect at least every hour regardless
 def get_con():
     return duckdb.connect(DB_PATH, read_only=True)
 
