@@ -52,19 +52,24 @@ st.markdown("""
 
 
 # ── DB connection (cached, reconnects automatically after a sync swap) ────────
-_db_mtime: float = 0.0
+@st.cache_resource
+def _db_state():
+    # Mutable dict stored in a cache_resource so it persists across reruns.
+    # Module-level plain variables reset to their initial value on every rerun,
+    # so they cannot reliably track state between Streamlit script executions.
+    return {"mtime": 0.0}
 
 def _maybe_reconnect():
     """Reconnect when the DB file is replaced by the sync job."""
-    global _db_mtime
+    state = _db_state()
     try:
         mtime = os.path.getmtime(DB_PATH)
     except OSError:
         return
-    if mtime != _db_mtime:
-        _db_mtime = mtime
+    if mtime != state["mtime"]:
+        state["mtime"] = mtime
         get_con.clear()
-        st.cache_data.clear()   # also flush stale query/cruise/unit caches
+        st.cache_data.clear()
 
 @st.cache_resource(ttl=3600)   # reconnect at least every hour regardless
 def get_con():
