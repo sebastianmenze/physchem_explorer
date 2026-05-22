@@ -757,11 +757,11 @@ if st.session_state.selected_op is not None:
 
 # ── export: fetch all readings for found operations with full metadata ─────────
 @st.cache_data(show_spinner="Building export dataset...")
-def build_export_df(operation_ids: tuple) -> pd.DataFrame:
+def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -> pd.DataFrame:
     """
     Fetch all readings for the given operations and pivot so that each
     parameter (TEMP, PSAL, PRES, ...) becomes its own column.
-    One row = one sample_number within one operation.
+    One row = one sample_number within one operation + instrument_type.
     Mission and operation metadata are repeated on every row.
     """
     if not operation_ids:
@@ -806,6 +806,8 @@ def build_export_df(operation_ids: tuple) -> pd.DataFrame:
         JOIN operations  o ON i.operation_id = o.operation_id
         JOIN missions    m USING (mission_id)
         WHERE o.operation_id IN ({ids_sql})
+          {" AND i.instrument_type = 'CTD'" if data_type_filter == "Profiles only" else
+           " AND i.instrument_type = 'BOT'" if data_type_filter == "Bottle values only" else ""}
         ORDER BY o.operation_id, r.sample_number, p.parameter_code
     """).df()
 
@@ -1110,7 +1112,7 @@ if not df.empty:
     st.markdown("### Download")
 
     op_ids = tuple(int(i) for i in df["operation_id"].tolist())
-    export_key = f"export_{hash(op_ids)}"
+    export_key = f"export_{hash(op_ids)}_{data_type_filter.replace(' ', '_')}"
 
     @st.cache_data(show_spinner=False)
     def get_reading_count(op_ids):
@@ -1203,7 +1205,7 @@ if not df.empty:
 
             # Step 1: build the base dataframe
             with st.spinner("Building export dataset..."):
-                edf = build_export_df(op_ids)
+                edf = build_export_df(op_ids, data_type_filter)
                 st.session_state[export_key + "_edf"] = edf
             st.rerun()  # show CSV button immediately
 
