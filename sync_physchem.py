@@ -399,16 +399,20 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
     # fall back to full mission fetch if /operation/{id} returns 404.
     per_op_endpoint_works = True   # probe on first use
 
-    for mission_id, new_op_ids in tqdm(missions_to_fetch.items(),
-                                       desc="Fetching new ops", unit="mission"):
+    def _ts():
+        return datetime.utcnow().strftime("%H:%M:%S")
+
+    for mission_id, new_op_ids in missions_to_fetch.items():
         if datetime.utcnow() > phase2_deadline:
-            tqdm.write(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.")
+            print(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.")
             break
         try:
             stored_via_per_op = set()
 
             if per_op_endpoint_works:
                 for op_id in new_op_ids:
+                    url = f"{API_BASE}/operation/{op_id}?extend=true"
+                    print(f"  [{_ts()}] mission={mission_id} op={op_id}  GET {url}", flush=True)
                     try:
                         op = _fetch_operation(op_id)
                         if op and op.get("id"):
@@ -418,21 +422,25 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
                             totals["params"]   += counts["params"]
                             totals["readings"] += counts["readings"]
                             stored_via_per_op.add(op_id)
+                            print(f"    → stored ({counts['readings']} readings)", flush=True)
                         elif op is None:
                             # 404 → endpoint doesn't exist, fall back permanently
                             per_op_endpoint_works = False
-                            tqdm.write("  Per-operation endpoint unavailable — switching to full-mission fetch.")
+                            print("  Per-operation endpoint unavailable — switching to full-mission fetch.", flush=True)
                             break
                     except Exception as e:
-                        tqdm.write(f"    op {op_id} failed: {e}")
+                        print(f"    → FAILED: {e}", flush=True)
 
             # Fetch remaining (or all if per-op doesn't work) via full mission tree
             remaining = new_op_ids - stored_via_per_op
             if remaining:
+                url = f"{API_BASE}/mission/{mission_id}/operation/list?extend=true"
+                print(f"  [{_ts()}] mission={mission_id} ops={sorted(remaining)}  GET {url}", flush=True)
                 full_ops = get_json(
                     f"{API_BASE}/mission/{mission_id}/operation/list",
                     params={"extend": "true"},
                 ) or []
+                print(f"    → response received ({len(full_ops)} operations in payload)", flush=True)
                 for op in full_ops:
                     if op.get("id") not in remaining:
                         continue
@@ -441,9 +449,10 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
                     totals["inst"]     += counts["inst"]
                     totals["params"]   += counts["params"]
                     totals["readings"] += counts["readings"]
+                    print(f"    → stored op={op.get('id')} ({counts['readings']} readings)", flush=True)
 
         except Exception as e:
-            tqdm.write(f"  !! Failed mission {mission_id}: {e}")
+            print(f"  !! Failed mission {mission_id}: {e}", flush=True)
 
     print(f"  Done. {totals['ops']} new operation(s), {totals['readings']:,} new reading(s).")
     return totals
