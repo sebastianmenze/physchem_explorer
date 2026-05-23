@@ -32,6 +32,7 @@ import argparse
 import duckdb
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from tqdm import tqdm
 import os
@@ -45,6 +46,7 @@ RETRY_DELAY       = 5     # seconds between retries on network/server errors
 CONNECT_TIMEOUT   = 30    # seconds to establish TCP connection
 READ_TIMEOUT      = 90    # seconds to wait for server to send data
 PHASE2_MAX_HOURS  = 3     # abort Phase 2 after this many hours to avoid overnight hangs
+PHASE2_WORKERS    = 20    # parallel threads for lightweight mission checks in Phase 2
 
 
 # ── schema ────────────────────────────────────────────────────────────────────
@@ -329,6 +331,19 @@ def find_active_mission_ids(con: duckdb.DuckDBPyConnection, active_window_days: 
     return [r[0] for r in rows]
 
 
+def _check_one_mission(mission_id: int, known_op_ids: set) -> tuple[int, set]:
+    """Worker: lightweight fetch to find new operation IDs for one mission."""
+    remote_ops = get_json(f"{API_BASE}/mission/{mission_id}/operation/list") or []
+    remote_ids = {op["id"] for op in remote_ops if op.get("id") is not None}
+    return mission_id, remote_ids - known_op_ids
+
+
+def _fetch_operation(op_id: int) -> dict | None:
+    """Try to fetch a single operation with full readings.
+    Returns None if the per-operation endpoint doesn't exist (404)."""
+    return get_json(f"{API_BASE}/operation/{op_id}", params={"extend": "true"})
+
+
 def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int) -> dict:
     """
     For each active/recent mission, fetch the lightweight operation list,
@@ -348,62 +363,89 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
         print("  No active missions to check.")
         return totals
 
-    missions_with_new = 0
+    # Load all known operation IDs in one query instead of N separate queries
+    ids_sql = ",".join(str(m) for m in mission_ids)
+    known_ops: dict[int, set] = {}
+    for mission_id, op_id in con.execute(
+        f"SELECT mission_id, operation_id FROM operations WHERE mission_id IN ({ids_sql})"
+    ).fetchall():
+        known_ops.setdefault(mission_id, set()).add(op_id)
+
     phase2_deadline = datetime.utcnow() + timedelta(hours=PHASE2_MAX_HOURS)
 
-    for mission_id in tqdm(mission_ids, desc="Checking missions", unit="mission"):
+    # ── Phase 2a: parallel lightweight checks ────────────────────────────────
+    # Run PHASE2_WORKERS concurrent GETs; each only fetches op IDs, not readings.
+    missions_to_fetch: dict[int, set] = {}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=PHASE2_WORKERS) as pool:
+        for mid in mission_ids:
+            futures[pool.submit(_check_one_mission, mid, known_ops.get(mid, set()))] = mid
+
+        for future in tqdm(as_completed(futures), total=len(futures),
+                           desc="Checking missions", unit="mission"):
+            mid = futures[future]
+            try:
+                _, new_op_ids = future.result()
+                if new_op_ids:
+                    missions_to_fetch[mid] = new_op_ids
+                    tqdm.write(f"  Mission {mid}: {len(new_op_ids)} new operation(s) found")
+            except Exception as e:
+                tqdm.write(f"  !! Mission {mid} check failed: {e}")
+
+    print(f"  {len(missions_to_fetch)} mission(s) have new operations — fetching now.")
+
+    # ── Phase 2b: fetch and store new operations ──────────────────────────────
+    # Try per-operation endpoint first (avoids downloading the whole mission);
+    # fall back to full mission fetch if /operation/{id} returns 404.
+    per_op_endpoint_works = True   # probe on first use
+
+    for mission_id, new_op_ids in tqdm(missions_to_fetch.items(),
+                                       desc="Fetching new ops", unit="mission"):
         if datetime.utcnow() > phase2_deadline:
             tqdm.write(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.")
             break
-
         try:
-            # Lightweight fetch: no ?extend — just get operation IDs and metadata
-            remote_ops = get_json(
-                f"{API_BASE}/mission/{mission_id}/operation/list"
-            ) or []
+            stored_via_per_op = set()
 
-            if not remote_ops:
-                continue
+            if per_op_endpoint_works:
+                for op_id in new_op_ids:
+                    try:
+                        op = _fetch_operation(op_id)
+                        if op and op.get("id"):
+                            counts = store_operation_tree(con, op, mission_id)
+                            totals["ops"]      += 1
+                            totals["inst"]     += counts["inst"]
+                            totals["params"]   += counts["params"]
+                            totals["readings"] += counts["readings"]
+                            stored_via_per_op.add(op_id)
+                        elif op is None:
+                            # 404 → endpoint doesn't exist, fall back permanently
+                            per_op_endpoint_works = False
+                            tqdm.write("  Per-operation endpoint unavailable — switching to full-mission fetch.")
+                            break
+                    except Exception as e:
+                        tqdm.write(f"    op {op_id} failed: {e}")
 
-            remote_ids = {op["id"] for op in remote_ops if op.get("id") is not None}
-            if not remote_ids:
-                continue
-
-            # Find which operation IDs are missing from the DB
-            known_ids = {
-                r[0] for r in con.execute(
-                    f"SELECT operation_id FROM operations WHERE mission_id = {mission_id}"
-                ).fetchall()
-            }
-            new_op_ids = remote_ids - known_ids
-
-            if not new_op_ids:
-                continue
-
-            missions_with_new += 1
-            tqdm.write(
-                f"  Mission {mission_id}: {len(new_op_ids)} new operation(s) found"
-            )
-
-            # Fetch full tree to get readings for the new operations
-            full_ops = get_json(
-                f"{API_BASE}/mission/{mission_id}/operation/list",
-                params={"extend": "true"},
-            ) or []
-
-            for op in full_ops:
-                if op.get("id") not in new_op_ids:
-                    continue
-                counts = store_operation_tree(con, op, mission_id)
-                totals["ops"]      += 1
-                totals["inst"]     += counts["inst"]
-                totals["params"]   += counts["params"]
-                totals["readings"] += counts["readings"]
+            # Fetch remaining (or all if per-op doesn't work) via full mission tree
+            remaining = new_op_ids - stored_via_per_op
+            if remaining:
+                full_ops = get_json(
+                    f"{API_BASE}/mission/{mission_id}/operation/list",
+                    params={"extend": "true"},
+                ) or []
+                for op in full_ops:
+                    if op.get("id") not in remaining:
+                        continue
+                    counts = store_operation_tree(con, op, mission_id)
+                    totals["ops"]      += 1
+                    totals["inst"]     += counts["inst"]
+                    totals["params"]   += counts["params"]
+                    totals["readings"] += counts["readings"]
 
         except Exception as e:
             tqdm.write(f"  !! Failed mission {mission_id}: {e}")
 
-    print(f"  {missions_with_new} mission(s) had new operations.")
+    print(f"  Done. {totals['ops']} new operation(s), {totals['readings']:,} new reading(s).")
     return totals
 
 
