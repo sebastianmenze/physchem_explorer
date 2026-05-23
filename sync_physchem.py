@@ -42,6 +42,9 @@ DB_PATH           = "data/physchem_all.duckdb"
 STOP_AFTER_MISSES = 500   # stop probing after this many consecutive 404s above max ID
 MAX_RETRIES       = 3
 RETRY_DELAY       = 5     # seconds between retries on network/server errors
+CONNECT_TIMEOUT   = 30    # seconds to establish TCP connection
+READ_TIMEOUT      = 90    # seconds to wait for server to send data
+PHASE2_MAX_HOURS  = 3     # abort Phase 2 after this many hours to avoid overnight hangs
 
 
 # ── schema ────────────────────────────────────────────────────────────────────
@@ -132,7 +135,7 @@ def get_json(url: str, params: dict | None = None):
     """GET with retries. Returns parsed JSON, None on 404, raises on other errors."""
     for attempt in range(MAX_RETRIES):
         try:
-            resp = requests.get(url, params=params, timeout=120)
+            resp = requests.get(url, params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             if resp.status_code == 404:
                 return None
             if resp.status_code in (401, 403):
@@ -346,8 +349,13 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
         return totals
 
     missions_with_new = 0
+    phase2_deadline = datetime.utcnow() + timedelta(hours=PHASE2_MAX_HOURS)
 
     for mission_id in tqdm(mission_ids, desc="Checking missions", unit="mission"):
+        if datetime.utcnow() > phase2_deadline:
+            tqdm.write(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.")
+            break
+
         try:
             # Lightweight fetch: no ?extend — just get operation IDs and metadata
             remote_ops = get_json(
