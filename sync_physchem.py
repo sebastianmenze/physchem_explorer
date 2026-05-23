@@ -46,8 +46,8 @@ RETRY_DELAY       = 5     # seconds between retries on network/server errors
 CONNECT_TIMEOUT   = 30    # seconds to establish TCP connection
 READ_TIMEOUT      = 90    # seconds to wait for server to send data
 PHASE2_MAX_HOURS  = 3     # abort Phase 2 after this many hours to avoid overnight hangs
-PHASE2_WORKERS       = 20    # parallel threads for lightweight mission checks in Phase 2
-PHASE2_FETCH_WORKERS = 5     # parallel threads for per-operation full fetches in Phase 2b
+PHASE2_WORKERS       = 20    # parallel threads for lightweight mission checks in Phase 2a
+PHASE2_FETCH_WORKERS = 1     # sequential Phase 2b — server is single-threaded per op, parallelism hurts
 
 
 # ── schema ────────────────────────────────────────────────────────────────────
@@ -395,89 +395,69 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
 
     print(f"  {len(missions_to_fetch)} mission(s) have new operations — fetching now.")
 
-    # ── Phase 2b: fetch and store new operations ──────────────────────────────
-    # The API generates ~19 readings/sec per connection (server-side bottleneck).
-    # Parallel fetches multiply throughput; DB writes stay on the main thread.
+    # ── Phase 2b: fetch and store new operations (sequential) ────────────────
+    # The API server processes ~19 readings/sec per connection regardless of
+    # parallelism — concurrent requests share that capacity and make each one
+    # slower. Sequential is fastest for large operations.
 
     def _ts():
         return datetime.utcnow().strftime("%H:%M:%S")
 
-    def _fetch_one(mission_id: int, op_id: int) -> tuple:
-        """Fetch one operation with full readings. Returns (mission_id, op_id, data_or_none, error)."""
-        url = f"{API_BASE}/operation/{op_id}?extend=true"
-        print(f"  [{_ts()}] START mission={mission_id} op={op_id}  GET {url}", flush=True)
-        try:
-            op = _fetch_operation(op_id)
-            return mission_id, op_id, op, None
-        except Exception as e:
-            return mission_id, op_id, None, e
-
-    # Flatten all (mission_id, op_id) pairs into one work list
-    work = [(mid, op_id) for mid, op_ids in missions_to_fetch.items() for op_id in op_ids]
-    print(f"  Fetching {len(work)} operation(s) with {PHASE2_FETCH_WORKERS} parallel workers.", flush=True)
-
     per_op_endpoint_works = True
-    fallback_missions: set[int] = set()   # missions where per-op endpoint returned 404
+    fallback_missions: set[int] = set()
 
-    with ThreadPoolExecutor(max_workers=PHASE2_FETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one, mid, op_id): (mid, op_id) for mid, op_id in work}
-
-        for future in tqdm(as_completed(futures), total=len(futures),
-                           desc="Fetching ops", unit="op"):
-            if datetime.utcnow() > phase2_deadline:
-                print(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — cancelling remaining.", flush=True)
-                for f in futures:
-                    f.cancel()
-                break
-
-            mission_id, op_id, op, err = future.result()
-
-            if err:
-                print(f"  [{_ts()}] FAILED op={op_id}: {err}", flush=True)
-                continue
-
-            if op is None:
-                # 404 — per-operation endpoint doesn't exist; queue mission for fallback
-                per_op_endpoint_works = False
-                fallback_missions.add(mission_id)
-                print(f"  [{_ts()}] op={op_id} → 404 (switching mission {mission_id} to full-mission fetch)", flush=True)
-                continue
-
-            counts = store_operation_tree(con, op, mission_id)
-            totals["ops"]      += 1
-            totals["inst"]     += counts["inst"]
-            totals["params"]   += counts["params"]
-            totals["readings"] += counts["readings"]
-            print(f"  [{_ts()}] DONE  op={op_id} ({counts['readings']} readings, total={totals['readings']:,})", flush=True)
-
-    # Fallback: full-mission fetch for any missions where /operation/{id} returned 404
-    for mission_id in fallback_missions:
+    for mission_id, new_op_ids in missions_to_fetch.items():
         if datetime.utcnow() > phase2_deadline:
+            print(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.", flush=True)
             break
-        new_op_ids = missions_to_fetch[mission_id]
-        already_stored = {r[0] for r in con.execute(
-            f"SELECT operation_id FROM operations WHERE mission_id = {mission_id}"
-        ).fetchall()}
-        remaining = new_op_ids - already_stored
-        if not remaining:
-            continue
-        url = f"{API_BASE}/mission/{mission_id}/operation/list?extend=true"
-        print(f"  [{_ts()}] FALLBACK mission={mission_id} ops={sorted(remaining)}  GET {url}", flush=True)
         try:
-            full_ops = get_json(f"{API_BASE}/mission/{mission_id}/operation/list",
-                                params={"extend": "true"}) or []
-            print(f"    → received {len(full_ops)} ops in payload", flush=True)
-            for op in full_ops:
-                if op.get("id") not in remaining:
-                    continue
-                counts = store_operation_tree(con, op, mission_id)
-                totals["ops"]      += 1
-                totals["inst"]     += counts["inst"]
-                totals["params"]   += counts["params"]
-                totals["readings"] += counts["readings"]
-                print(f"    → stored op={op.get('id')} ({counts['readings']} readings)", flush=True)
+            stored = set()
+
+            if per_op_endpoint_works:
+                for op_id in sorted(new_op_ids):
+                    url = f"{API_BASE}/operation/{op_id}?extend=true"
+                    print(f"  [{_ts()}] GET {url}", flush=True)
+                    t0 = datetime.utcnow()
+                    op = _fetch_operation(op_id)
+                    elapsed = (datetime.utcnow() - t0).seconds
+                    if op and op.get("id"):
+                        counts = store_operation_tree(con, op, mission_id)
+                        totals["ops"]      += 1
+                        totals["inst"]     += counts["inst"]
+                        totals["params"]   += counts["params"]
+                        totals["readings"] += counts["readings"]
+                        stored.add(op_id)
+                        print(f"    → {counts['readings']} readings in {elapsed}s  (total {totals['readings']:,})", flush=True)
+                    elif op is None:
+                        per_op_endpoint_works = False
+                        fallback_missions.add(mission_id)
+                        print(f"    → 404 — switching to full-mission fetch for mission {mission_id}", flush=True)
+                        break
+                    else:
+                        print(f"    → empty response", flush=True)
+
+            # Full-mission fallback if /operation/{id} returned 404
+            remaining = new_op_ids - stored
+            if remaining:
+                url = f"{API_BASE}/mission/{mission_id}/operation/list?extend=true"
+                print(f"  [{_ts()}] GET {url}  (ops needed: {sorted(remaining)})", flush=True)
+                t0 = datetime.utcnow()
+                full_ops = get_json(f"{API_BASE}/mission/{mission_id}/operation/list",
+                                    params={"extend": "true"}) or []
+                elapsed = (datetime.utcnow() - t0).seconds
+                print(f"    → response in {elapsed}s, {len(full_ops)} ops in payload", flush=True)
+                for op in full_ops:
+                    if op.get("id") not in remaining:
+                        continue
+                    counts = store_operation_tree(con, op, mission_id)
+                    totals["ops"]      += 1
+                    totals["inst"]     += counts["inst"]
+                    totals["params"]   += counts["params"]
+                    totals["readings"] += counts["readings"]
+                    print(f"    → stored op={op.get('id')} ({counts['readings']} readings)", flush=True)
+
         except Exception as e:
-            print(f"    → FAILED: {e}", flush=True)
+            print(f"  !! Failed mission {mission_id}: {e}", flush=True)
 
     print(f"  Done. {totals['ops']} new operation(s), {totals['readings']:,} new reading(s).")
     return totals
