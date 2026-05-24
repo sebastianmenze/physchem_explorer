@@ -84,23 +84,37 @@ def get_con():
     return duckdb.connect(DB_PATH, read_only=True)
 
 
+_DB_ERR_HINT = (
+    "The database file may be **corrupt or missing**.  \n"
+    "Run the sync to rebuild it:  \n"
+    "```\ndocker compose exec sync python /app/sync_physchem.py "
+    "--db /data/physchem_all.duckdb\n```  \n"
+    "Refresh this page once the sync finishes."
+)
+
 try:
     _maybe_reconnect()
     con = get_con()
+    # Validate data is readable before the sidebar runs any queries.
+    # A corrupt block triggers duckdb.FatalException here rather than in the
+    # middle of rendering, which would leave the page looking blank.
+    con.execute("SELECT 1 FROM operations LIMIT 1").fetchone()
 except Exception as _db_err:
-    st.error(
-        f"**Database unavailable** — {_db_err}  \n\n"
-        "The file may be corrupt or missing. "
-        "Check `docker compose logs sync` and refresh once the next sync completes, "
-        "or run `python sync_physchem.py` manually to rebuild the database."
-    )
+    try:
+        get_con.clear()   # force a fresh connect attempt on next load
+    except Exception:
+        pass
+    st.error(f"**Database unavailable** — {_db_err}  \n\n{_DB_ERR_HINT}")
     st.stop()
 
 
 # ── check DB has data ─────────────────────────────────────────────────────────
 def check_db():
-    n = con.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
-    return n > 0
+    try:
+        n = con.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        return n > 0
+    except Exception:
+        return False
 
 
 @st.cache_data(show_spinner=False)
@@ -126,11 +140,14 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### Cruise")
-    cruises = ["— All —"] + sorted([
-        r[0] for r in con.execute(
-            "SELECT DISTINCT cruise FROM missions WHERE cruise IS NOT NULL ORDER BY 1"
-        ).fetchall()
-    ])
+    try:
+        cruises = ["— All —"] + sorted([
+            r[0] for r in con.execute(
+                "SELECT DISTINCT cruise FROM missions WHERE cruise IS NOT NULL ORDER BY 1"
+            ).fetchall()
+        ])
+    except Exception:
+        cruises = ["— All —"]
     cruise_filter = st.selectbox("Cruise number", cruises)
     cruise_active = cruise_filter != "— All —"
 
@@ -224,11 +241,14 @@ with st.sidebar:
                 st.rerun()
 
     st.markdown("### Platform filter")
-    platforms = ["All"] + sorted([
-        r[0] for r in con.execute(
-            "SELECT DISTINCT platform_name FROM missions WHERE platform_name IS NOT NULL ORDER BY 1"
-        ).fetchall()
-    ])
+    try:
+        platforms = ["All"] + sorted([
+            r[0] for r in con.execute(
+                "SELECT DISTINCT platform_name FROM missions WHERE platform_name IS NOT NULL ORDER BY 1"
+            ).fetchall()
+        ])
+    except Exception:
+        platforms = ["All"]
     platform_filter = st.selectbox("Platform", platforms)
 
     st.markdown("### Data type")
@@ -620,15 +640,19 @@ if not check_db():
 # ── run search ────────────────────────────────────────────────────────────────
 if search_clicked:
     with st.spinner("Searching..."):
-        _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter, data_type_filter)
-        if st.session_state.get("drawn_polygon"):
-            _results = filter_by_polygon(_results, st.session_state.drawn_polygon)
-        st.session_state.results     = _results
-        st.session_state.selected_op = None
-        st.session_state.profile     = pd.DataFrame()
-        st.session_state.bot_profile = pd.DataFrame()
-        st.session_state.map_center  = None
-        st.session_state.map_zoom    = None
+        try:
+            _results = run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform_filter, cruise_filter, data_type_filter)
+            if st.session_state.get("drawn_polygon"):
+                _results = filter_by_polygon(_results, st.session_state.drawn_polygon)
+            st.session_state.results     = _results
+            st.session_state.selected_op = None
+            st.session_state.profile     = pd.DataFrame()
+            st.session_state.bot_profile = pd.DataFrame()
+            st.session_state.map_center  = None
+            st.session_state.map_zoom    = None
+        except Exception as _search_err:
+            get_con.clear()
+            st.error(f"Search failed — {_search_err}  \n\n{_DB_ERR_HINT}")
 
 df = st.session_state.results
 
@@ -695,8 +719,12 @@ if clicked and not df.empty:
             st.session_state.last_clicked = closest_id
             st.session_state.selected_op  = closest_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile     = fetch_profile(closest_id)
-                st.session_state.bot_profile = fetch_bot_profile(closest_id)
+                try:
+                    st.session_state.profile     = fetch_profile(closest_id)
+                    st.session_state.bot_profile = fetch_bot_profile(closest_id)
+                except Exception as _pe:
+                    get_con.clear()
+                    st.error(f"Profile load failed — {_pe}  \n\n{_DB_ERR_HINT}")
             st.rerun()
 
 # ── metadata + profile row (only when an op is selected) ─────────────────────
@@ -1121,8 +1149,12 @@ if not df.empty:
             st.session_state.map_center  = [float(tbl_row.lat), float(tbl_row.lon)]
             st.session_state.selected_op = selected_op_id
             with st.spinner("Loading profile..."):
-                st.session_state.profile     = fetch_profile(selected_op_id)
-                st.session_state.bot_profile = fetch_bot_profile(selected_op_id)
+                try:
+                    st.session_state.profile     = fetch_profile(selected_op_id)
+                    st.session_state.bot_profile = fetch_bot_profile(selected_op_id)
+                except Exception as _pe:
+                    get_con.clear()
+                    st.error(f"Profile load failed — {_pe}  \n\n{_DB_ERR_HINT}")
             st.rerun()
 
 # ── download panel ────────────────────────────────────────────────────────────
