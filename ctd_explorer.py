@@ -60,13 +60,21 @@ def _db_state():
     return {"mtime": 0.0}
 
 def _maybe_reconnect():
-    """Reconnect when the DB file is replaced by the sync job."""
+    """Reconnect when the DB file changes or if the connection was invalidated."""
     state = _db_state()
     try:
         mtime = os.path.getmtime(DB_PATH)
     except OSError:
         return
-    if mtime != state["mtime"]:
+    needs_reconnect = mtime != state["mtime"]
+    if not needs_reconnect:
+        # A duckdb.FatalException marks the cached connection permanently broken.
+        # Detect this with a cheap ping so the next get_con() opens a fresh handle.
+        try:
+            get_con().execute("SELECT 1")
+        except Exception:
+            needs_reconnect = True
+    if needs_reconnect:
         state["mtime"] = mtime
         get_con.clear()
         st.cache_data.clear()
@@ -76,8 +84,17 @@ def get_con():
     return duckdb.connect(DB_PATH, read_only=True)
 
 
-_maybe_reconnect()
-con = get_con()
+try:
+    _maybe_reconnect()
+    con = get_con()
+except Exception as _db_err:
+    st.error(
+        f"**Database unavailable** — {_db_err}  \n\n"
+        "The file may be corrupt or missing. "
+        "Check `docker compose logs sync` and refresh once the next sync completes, "
+        "or run `python sync_physchem.py` manually to rebuild the database."
+    )
+    st.stop()
 
 
 # ── check DB has data ─────────────────────────────────────────────────────────
