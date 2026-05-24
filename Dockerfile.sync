@@ -1,8 +1,5 @@
 FROM python:3.11-slim
 
-# Grab just the docker CLI binary — no daemon, no heavy apt package
-COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
-
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends cron \

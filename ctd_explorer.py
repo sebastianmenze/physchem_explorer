@@ -410,11 +410,13 @@ def build_map(df: pd.DataFrame, selected_op_id=None, center=None):
         edit_options={"edit": False, "remove": True},
     ).add_to(m)
 
-    # Render bounding box when active (rectangle only — drawn polygon is kept
-    # in the Leaflet.Draw layer, which persists via key="main_map"; adding a
-    # second folium.Polygon overlay causes the map to pulsate/reload).
+    # Render bounding box when active — only for manually typed coordinates.
+    # Drawn shapes (rectangle or polygon) are kept in the Leaflet.Draw layer
+    # that persists via key="main_map"; adding a second folium overlay on top
+    # causes the map to pulsate/reload on every render.
     _active_poly = st.session_state.get("drawn_polygon", [])
-    if not _active_poly and not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
+    _active_bbox = st.session_state.get("drawn_bbox", {})
+    if not _active_poly and not _active_bbox and not (lat_min == -90 and lat_max == 90 and lon_min == -180 and lon_max == 180):
         folium.Rectangle(
             bounds=[[lat_min, lon_min], [lat_max, lon_max]],
             color="#1a73e8", weight=1.5, fill=True, fill_opacity=0.04,
