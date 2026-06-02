@@ -57,16 +57,29 @@ def _db_state():
     # Mutable dict stored in a cache_resource so it persists across reruns.
     # Module-level plain variables reset to their initial value on every rerun,
     # so they cannot reliably track state between Streamlit script executions.
-    return {"mtime": 0.0}
+    return {"sig": None}
+
+def _db_signature():
+    """Return a change signature for the DB file, or None if it's missing.
+
+    The sync job swaps in a brand-new file with os.replace(), which changes the
+    inode. Including st_ino makes detection robust even when mtime is preserved
+    or when a bind mount caches the path's mtime attribute. st_size guards the
+    rare inode-reuse case.
+    """
+    try:
+        s = os.stat(DB_PATH)
+    except OSError:
+        return None
+    return (s.st_mtime, s.st_size, s.st_ino)
 
 def _maybe_reconnect():
     """Reconnect when the DB file changes or if the connection was invalidated."""
     state = _db_state()
-    try:
-        mtime = os.path.getmtime(DB_PATH)
-    except OSError:
+    sig = _db_signature()
+    if sig is None:
         return
-    needs_reconnect = mtime != state["mtime"]
+    needs_reconnect = sig != state["sig"]
     if not needs_reconnect:
         # A duckdb.FatalException marks the cached connection permanently broken.
         # Detect this with a cheap ping so the next get_con() opens a fresh handle.
@@ -75,11 +88,17 @@ def _maybe_reconnect():
         except Exception:
             needs_reconnect = True
     if needs_reconnect:
-        state["mtime"] = mtime
+        state["sig"] = sig
         get_con.clear()
         st.cache_data.clear()
 
-@st.cache_resource(ttl=3600)   # reconnect at least every hour regardless
+def _force_reload():
+    """Manual hard refresh: drop the cached connection and all cached queries."""
+    _db_state()["sig"] = None
+    get_con.clear()
+    st.cache_data.clear()
+
+@st.cache_resource(ttl=900)   # reconnect at least every 15 min regardless
 def get_con():
     return duckdb.connect(DB_PATH, read_only=True)
 
@@ -260,6 +279,19 @@ with st.sidebar:
 
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
+
+    # ── data freshness indicator + manual reload ──────────────────────────────
+    st.markdown("---")
+    try:
+        _n_ops = con.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        _mt    = os.path.getmtime(DB_PATH)
+        _mt_str = datetime.utcfromtimestamp(_mt).strftime("%Y-%m-%d %H:%M UTC")
+        st.caption(f"📊 {_n_ops:,} operations · updated {_mt_str}")
+    except Exception:
+        st.caption("📊 Database status unavailable")
+    if st.button("🔄  Reload latest data", width='stretch'):
+        _force_reload()
+        st.rerun()
 
 
 # Ensure drawn bbox always takes precedence over number input widget state.
