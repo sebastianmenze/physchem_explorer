@@ -280,7 +280,7 @@ with st.sidebar:
     st.markdown("---")
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
-    # ── data freshness indicator + manual reload ──────────────────────────────
+    # ── data freshness indicator ──────────────────────────────────────────────
     st.markdown("---")
     try:
         _n_ops = con.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
@@ -289,9 +289,6 @@ with st.sidebar:
         st.caption(f"📊 {_n_ops:,} operations · updated {_mt_str}")
     except Exception:
         st.caption("📊 Database status unavailable")
-    if st.button("🔄  Reload latest data", width='stretch'):
-        _force_reload()
-        st.rerun()
 
 
 # Ensure drawn bbox always takes precedence over number input widget state.
