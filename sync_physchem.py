@@ -332,17 +332,52 @@ def find_active_mission_ids(con: duckdb.DuckDBPyConnection, active_window_days: 
     return [r[0] for r in rows]
 
 
-def _check_one_mission(mission_id: int, known_op_ids: set) -> tuple[int, set]:
-    """Worker: lightweight fetch to find new operation IDs for one mission."""
+def _check_one_mission(mission_id: int, known_op_ids: set) -> tuple[int, dict]:
+    """Worker: lightweight fetch to find new operations for one mission.
+
+    Returns {op_id: op_metadata_dict} for operations not already in the DB.
+    The metadata dict comes from the mission operation-list — the same source
+    that populated all existing (searchable) operations — so it reliably
+    contains timeStart / latitudeStart / longitudeStart. The per-operation
+    endpoint used later for readings does NOT always include these fields.
+    """
     remote_ops = get_json(f"{API_BASE}/mission/{mission_id}/operation/list") or []
-    remote_ids = {op["id"] for op in remote_ops if op.get("id") is not None}
-    return mission_id, remote_ids - known_op_ids
+    new_ops = {
+        op["id"]: op
+        for op in remote_ops
+        if op.get("id") is not None and op["id"] not in known_op_ids
+    }
+    return mission_id, new_ops
 
 
 def _fetch_operation(op_id: int) -> dict | None:
     """Try to fetch a single operation with full readings.
     Returns None if the per-operation endpoint doesn't exist (404)."""
     return get_json(f"{API_BASE}/operation/{op_id}", params={"extend": "true"})
+
+
+# Operation-level metadata fields the app relies on for search/display.
+_OP_META_FIELDS = (
+    "operationNumber", "operationType", "stationType",
+    "timeStart", "timeEnd",
+    "latitudeStart", "longitudeStart", "latitudeEnd", "longitudeEnd",
+    "bottomDepthStart", "operationComment",
+)
+
+
+def _merge_op_metadata(meta: dict | None, op: dict) -> dict:
+    """Overlay authoritative operation metadata from the operation-list onto the
+    per-operation payload (which carries the instrument/reading tree but may lack
+    operation-level fields). ``meta`` values win for the metadata fields when
+    present; everything else (id, instrument tree, ...) is kept from ``op``."""
+    if not meta:
+        return op
+    merged = dict(op)
+    for k in _OP_META_FIELDS:
+        v = meta.get(k)
+        if v is not None:
+            merged[k] = v
+    return merged
 
 
 def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int) -> dict:
@@ -375,8 +410,9 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
     phase2_deadline = datetime.utcnow() + timedelta(hours=PHASE2_MAX_HOURS)
 
     # ── Phase 2a: parallel lightweight checks ────────────────────────────────
-    # Run PHASE2_WORKERS concurrent GETs; each only fetches op IDs, not readings.
-    missions_to_fetch: dict[int, set] = {}
+    # Run PHASE2_WORKERS concurrent GETs; each fetches the operation list
+    # (metadata, no readings) and returns {op_id: metadata} for new operations.
+    missions_to_fetch: dict[int, dict] = {}
     futures = {}
     with ThreadPoolExecutor(max_workers=PHASE2_WORKERS) as pool:
         for mid in mission_ids:
@@ -386,10 +422,10 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
                            desc="Checking missions", unit="mission"):
             mid = futures[future]
             try:
-                _, new_op_ids = future.result()
-                if new_op_ids:
-                    missions_to_fetch[mid] = new_op_ids
-                    tqdm.write(f"  Mission {mid}: {len(new_op_ids)} new operation(s) found")
+                _, new_ops = future.result()
+                if new_ops:
+                    missions_to_fetch[mid] = new_ops
+                    tqdm.write(f"  Mission {mid}: {len(new_ops)} new operation(s) found")
             except Exception as e:
                 tqdm.write(f"  !! Mission {mid} check failed: {e}")
 
@@ -406,7 +442,7 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
     per_op_endpoint_works = True
     fallback_missions: set[int] = set()
 
-    for mission_id, new_op_ids in missions_to_fetch.items():
+    for mission_id, new_ops in missions_to_fetch.items():
         if datetime.utcnow() > phase2_deadline:
             print(f"  !! Phase 2 time limit ({PHASE2_MAX_HOURS}h) reached — stopping early.", flush=True)
             break
@@ -414,13 +450,20 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
             stored = set()
 
             if per_op_endpoint_works:
-                for op_id in sorted(new_op_ids):
+                for op_id in sorted(new_ops):
                     url = f"{API_BASE}/operation/{op_id}?extend=true"
                     print(f"  [{_ts()}] GET {url}", flush=True)
                     t0 = datetime.utcnow()
                     op = _fetch_operation(op_id)
                     elapsed = (datetime.utcnow() - t0).seconds
                     if op and op.get("id"):
+                        # The per-op endpoint reliably returns the instrument /
+                        # reading tree but may omit operation-level metadata
+                        # (timeStart, latitudeStart, ...). Merge the authoritative
+                        # metadata from the operation-list over it so lat/lon/time
+                        # are always populated — otherwise the operation is stored
+                        # with NULL coords/time and is invisible to the app search.
+                        op = _merge_op_metadata(new_ops.get(op_id), op)
                         counts = store_operation_tree(con, op, mission_id)
                         totals["ops"]      += 1
                         totals["inst"]     += counts["inst"]
@@ -437,7 +480,7 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
                         print(f"    → empty response", flush=True)
 
             # Full-mission fallback if /operation/{id} returned 404
-            remaining = new_op_ids - stored
+            remaining = set(new_ops) - stored
             if remaining:
                 url = f"{API_BASE}/mission/{mission_id}/operation/list?extend=true"
                 print(f"  [{_ts()}] GET {url}  (ops needed: {sorted(remaining)})", flush=True)
@@ -461,6 +504,76 @@ def sync_active_missions(con: duckdb.DuckDBPyConnection, active_window_days: int
 
     print(f"  Done. {totals['ops']} new operation(s), {totals['readings']:,} new reading(s).")
     return totals
+
+
+# ── repair: backfill operations stored with missing metadata ──────────────────
+
+def repair_missing_metadata(con: duckdb.DuckDBPyConnection) -> int:
+    """Backfill operations that were stored without location/time metadata.
+
+    Operations fetched via the per-operation endpoint before the metadata-merge
+    fix landed may have NULL time_start / latitude_start / longitude_start, which
+    makes them invisible to the app search (its WHERE clause requires those
+    fields). Re-fetch the affected missions' operation lists (cheap, no readings)
+    and update just the metadata columns. Readings/instruments are untouched.
+    """
+    broken = con.execute("""
+        SELECT mission_id, operation_id
+        FROM operations
+        WHERE time_start IS NULL
+           OR latitude_start IS NULL
+           OR longitude_start IS NULL
+    """).fetchall()
+    if not broken:
+        print("\n── Repair: no operations with missing metadata ──")
+        return 0
+
+    by_mission: dict[int, set] = {}
+    for mission_id, op_id in broken:
+        by_mission.setdefault(mission_id, set()).add(op_id)
+
+    print(f"\n── Repair: {len(broken)} operation(s) missing metadata "
+          f"across {len(by_mission)} mission(s) ──")
+
+    fixed = 0
+    for mission_id, op_ids in by_mission.items():
+        try:
+            ops = get_json(f"{API_BASE}/mission/{mission_id}/operation/list") or []
+        except Exception as e:
+            print(f"  !! Mission {mission_id}: fetch failed ({e})", flush=True)
+            continue
+        by_id = {op.get("id"): op for op in ops if op.get("id") is not None}
+        for op_id in op_ids:
+            meta = by_id.get(op_id)
+            if not meta:
+                continue
+            con.execute("""
+                UPDATE operations SET
+                    operation_number  = COALESCE(?, operation_number),
+                    operation_type    = COALESCE(?, operation_type),
+                    station_type      = COALESCE(?, station_type),
+                    time_start        = COALESCE(?, time_start),
+                    time_end          = COALESCE(?, time_end),
+                    latitude_start    = COALESCE(?, latitude_start),
+                    longitude_start   = COALESCE(?, longitude_start),
+                    latitude_end      = COALESCE(?, latitude_end),
+                    longitude_end     = COALESCE(?, longitude_end),
+                    bottom_depth      = COALESCE(?, bottom_depth),
+                    operation_comment = COALESCE(?, operation_comment)
+                WHERE operation_id = ?
+            """, [
+                meta.get("operationNumber"), meta.get("operationType"),
+                meta.get("stationType"),     meta.get("timeStart"),
+                meta.get("timeEnd"),         meta.get("latitudeStart"),
+                meta.get("longitudeStart"),  meta.get("latitudeEnd"),
+                meta.get("longitudeEnd"),    meta.get("bottomDepthStart"),
+                meta.get("operationComment"), op_id,
+            ])
+            fixed += 1
+        print(f"  Mission {mission_id}: repaired {len(op_ids)} operation(s)", flush=True)
+
+    print(f"  Repair complete: {fixed} operation(s) updated.")
+    return fixed
 
 
 # ── summary ───────────────────────────────────────────────────────────────────
@@ -515,6 +628,10 @@ def main():
 
     # ── Phase 2: new operations in active missions
     delta2 = sync_active_missions(con, args.active_days)
+    con.execute("CHECKPOINT")
+
+    # ── Repair: backfill any operations stored without location/time metadata
+    repair_missing_metadata(con)
     con.execute("CHECKPOINT")
 
     # ── Delta summary
