@@ -281,12 +281,24 @@ with st.sidebar:
     search_clicked = st.button("🔍  Search", width='stretch', type="primary")
 
     # ── data freshness indicator ──────────────────────────────────────────────
+    # Two distinct dates are shown, because they answer different questions:
+    #   • "latest data"  = MAX(time_start) — the newest measurement in the DB.
+    #                       This is the recency users actually care about.
+    #   • "synced"        = DB file mtime — when the sync last rewrote the file.
+    #                       The file can be rewritten today even if no new
+    #                       measurements were published (0 new operations).
     st.markdown("---")
     try:
-        _n_ops = con.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
-        _mt    = os.path.getmtime(DB_PATH)
-        _mt_str = datetime.utcfromtimestamp(_mt).strftime("%Y-%m-%d %H:%M UTC")
-        st.caption(f"📊 {_n_ops:,} operations · updated {_mt_str}")
+        _n_ops, _latest = con.execute(
+            "SELECT COUNT(*), MAX(time_start) FROM operations"
+        ).fetchone()
+        _mt = os.path.getmtime(DB_PATH)
+        _synced_str = datetime.utcfromtimestamp(_mt).strftime("%Y-%m-%d %H:%M UTC")
+        _latest_str = str(_latest)[:10] if _latest is not None else "—"
+        st.caption(
+            f"📊 {_n_ops:,} operations · latest data {_latest_str} · "
+            f"synced {_synced_str}"
+        )
     except Exception:
         st.caption("📊 Database status unavailable")
 
