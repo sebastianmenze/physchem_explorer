@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Grab just the docker CLI binary — no daemon, no heavy apt package.
+# Used to restart the streamlit containers after each sync (see entrypoint).
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends cron \

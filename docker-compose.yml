@@ -23,7 +23,8 @@ services:
       dockerfile: Dockerfile.sync
     restart: unless-stopped
     volumes:
-      - ./data:/data:rw    # needs write access; streamlit uses :ro
+      - ./data:/data:rw                           # needs write access; streamlit uses :ro
+      - /var/run/docker.sock:/var/run/docker.sock # lets sync restart streamlit after each swap
     environment:
       - DB_PATH=/data/physchem_all.duckdb
       - SYNC_SCHEDULE=0 2 * * *  # daily at 02:00 UTC — edit to taste
