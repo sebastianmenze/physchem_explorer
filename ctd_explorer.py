@@ -14,6 +14,7 @@ Docker run:
 
 import io
 import os
+import re
 import duckdb
 import pandas as pd
 import numpy as np
@@ -844,16 +845,31 @@ if st.session_state.selected_op is not None:
 
 
 # ── export: fetch all readings for found operations with full metadata ─────────
+def _sanitize_unit(u: str) -> str:
+    """Turn a unit string into a column-name-safe token (e.g. 'µmol/kg' -> 'mol_kg').
+    Non-alphanumeric runs collapse to a single underscore; empty -> 'nounit'."""
+    s = re.sub(r"[^0-9A-Za-z]+", "_", u or "").strip("_")
+    return s or "nounit"
+
+
 @st.cache_data(show_spinner="Building export dataset...")
-def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -> pd.DataFrame:
+def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
     """
     Fetch all readings for the given operations and pivot so that each
     parameter (TEMP, PSAL, PRES, ...) becomes its own column.
     One row = one sample_number within one operation + instrument_type.
     Mission and operation metadata are repeated on every row.
+
+    Units are never mixed within a column: if a parameter code appears with
+    more than one distinct unit across the selected operations (e.g. oxygen in
+    ml/l vs µmol/kg), each (code, unit) gets its own column so incomparable
+    values are kept apart.
+
+    Returns (dataframe, {column_name: unit}). The unit map keys match the
+    parameter/QC column names exactly, so callers can label without guessing.
     """
     if not operation_ids:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     ids_sql = ",".join(str(i) for i in operation_ids)
 
@@ -900,7 +916,7 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -
     """).df()
 
     if raw.empty:
-        return raw
+        return raw, {}
 
     # Metadata columns repeated on every row (carried via merge, not used as pivot index)
     # instrument_type is part of the pivot index — CTD and BOT are separate profiles
@@ -912,13 +928,35 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -
         "instrument_serial_number", "instrument_model",
     ]
 
-    # Deduplicate: CTD and BOT from the same operation are separate profiles
-    raw = raw.drop_duplicates(subset=["operation_id", "instrument_type", "sample_number", "parameter_code"])
+    # ── unit-aware column keys ────────────────────────────────────────────────
+    # A parameter code that appears with >1 distinct unit across the selected
+    # operations is not comparable across those units, so give each unit its own
+    # column (code + "__" + sanitized-unit). Single-unit codes keep the bare code.
+    raw["units"] = raw["units"].fillna("").astype(str).str.strip()
+    units_by_code = raw.groupby("parameter_code")["units"].agg(lambda s: sorted(set(s)))
+    split_codes   = {code for code, us in units_by_code.items() if len(us) > 1}
+
+    def _col_key(code, unit):
+        return f"{code}__{_sanitize_unit(unit)}" if code in split_codes else code
+
+    raw["col_key"] = [_col_key(c, u) for c, u in zip(raw["parameter_code"], raw["units"])]
+
+    # Map each resulting column (value + QC) to its unit and base code
+    key_to_code: dict = {}
+    unit_map:    dict = {}
+    for code, unit, key in zip(raw["parameter_code"], raw["units"], raw["col_key"]):
+        key_to_code[key] = code
+        if unit:
+            unit_map[key]          = unit
+            unit_map[f"{key}_QC"]  = unit
+
+    # Deduplicate on the pivot key so (op, instrument_type, sample, col_key) is unique
+    raw = raw.drop_duplicates(subset=["operation_id", "instrument_type", "sample_number", "col_key"])
 
     # Pivot value_dec — one row per (operation, instrument_type, sample)
     pivoted = raw.pivot(
         index=["operation_id", "instrument_type", "sample_number"],
-        columns="parameter_code",
+        columns="col_key",
         values="value_dec",
     ).reset_index()
     pivoted.columns.name = None
@@ -926,12 +964,12 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -
     # Pivot quality flags
     quality = raw.pivot(
         index=["operation_id", "instrument_type", "sample_number"],
-        columns="parameter_code",
+        columns="col_key",
         values="quality",
     ).reset_index()
     quality.columns.name = None
-    param_codes = [c for c in quality.columns if c not in ["operation_id", "instrument_type", "sample_number"]]
-    quality = quality.rename(columns={c: f"{c}_QC" for c in param_codes})
+    param_keys = [c for c in quality.columns if c not in ["operation_id", "instrument_type", "sample_number"]]
+    quality = quality.rename(columns={c: f"{c}_QC" for c in param_keys})
 
     # Merge pivoted values + QC
     wide = pivoted.merge(quality, on=["operation_id", "instrument_type", "sample_number"], how="left")
@@ -943,11 +981,16 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -
 
     result = meta.merge(wide, on=["operation_id", "instrument_type", "sample_number"], how="right")
 
-    # Order columns: meta first, then PRES/DEPTH, then other params, then QC flags
+    # Order columns: meta first, then PRES/DEPTH, then other params, then QC flags.
+    # Priority is matched on the base code so split columns (e.g. PRES__dbar) sort too.
     param_value_cols = [c for c in wide.columns
                         if c not in ["operation_id", "instrument_type", "sample_number"] and not c.endswith("_QC")]
     qc_cols          = [c for c in wide.columns if c.endswith("_QC")]
-    priority         = [c for c in ["PRES", "DEPTH", "DEPH"] if c in param_value_cols]
+    _prio_order      = ["PRES", "DEPTH", "DEPH"]
+    priority         = sorted(
+        [c for c in param_value_cols if key_to_code.get(c, c) in _prio_order],
+        key=lambda c: (_prio_order.index(key_to_code.get(c, c)), c),
+    )
     rest             = sorted([c for c in param_value_cols if c not in priority])
     ordered_params   = priority + rest
     ordered_qc       = [f"{c}_QC" for c in ordered_params if f"{c}_QC" in qc_cols]
@@ -955,22 +998,7 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT") -
     final_cols = (["operation_id", "instrument_type", "sample_number", "value_datetime"] +
                   [c for c in meta_cols if c not in ["operation_id"]] +
                   ordered_params + ordered_qc)
-    return result[[c for c in final_cols if c in result.columns]]
-
-
-@st.cache_data(show_spinner=False)
-def get_param_units(op_ids: tuple) -> dict:
-    """Return {parameter_code: units} for all parameters in the given operations."""
-    ids_sql = ",".join(str(i) for i in op_ids)
-    rows = con.execute(f"""
-        SELECT DISTINCT p.parameter_code, p.units
-        FROM parameters p
-        JOIN instruments i USING (instrument_id)
-        WHERE i.operation_id IN ({ids_sql})
-          AND p.units IS NOT NULL
-          AND p.units != ''
-    """).fetchall()
-    return {code: unit for code, unit in rows if unit and str(unit).strip()}
+    return result[[c for c in final_cols if c in result.columns]], unit_map
 
 
 def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
@@ -1292,20 +1320,23 @@ if not df.empty:
     with prep_col:
         if st.button("Prepare downloads", type="primary", width='stretch', key="prep_dl"):
             # Clear any previous export for this result set
-            for suffix in ["_csv", "_nc", "_nc_err", "_xl", "_edf"]:
+            for suffix in ["_csv", "_nc", "_nc_err", "_xl", "_edf", "_units"]:
                 st.session_state.pop(export_key + suffix, None)
 
-            # Step 1: build the base dataframe
+            # Step 1: build the base dataframe (+ unit map keyed to its columns)
             with st.spinner("Building export dataset..."):
-                edf = build_export_df(op_ids, data_type_filter)
-                st.session_state[export_key + "_edf"] = edf
+                edf, edf_units = build_export_df(op_ids, data_type_filter)
+                st.session_state[export_key + "_edf"]   = edf
+                st.session_state[export_key + "_units"] = edf_units
             st.rerun()  # show CSV button immediately
 
     # Render columns for whatever is ready so far
     dl_col1, dl_col2, dl_col3 = st.columns(3)
 
     edf = st.session_state.get(export_key + "_edf")
-    param_units = get_param_units(op_ids)
+    # Unit map built alongside edf — keys match its columns exactly (incl. any
+    # unit-split columns), so labels are always correct and never mixed.
+    param_units = st.session_state.get(export_key + "_units", {})
 
     # ── CSV ───────────────────────────────────────────────────────────────────
     with dl_col1:
