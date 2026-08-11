@@ -405,8 +405,20 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
 
 
 # ── fetch T/S profile for one operation ──────────────────────────────────────
-def fetch_profile(operation_id: int) -> pd.DataFrame:
-    return con.execute("""
+# Parameter-code aliases. Physchem uses 'DOXY' for oxygen; chlorophyll-a can
+# appear under several codes depending on sensor / processing chain. Matched
+# case-insensitively — adjust these lists if a dataset uses a different code.
+OXY_CODES = ("DOXY",)
+CHL_CODES = ("CPHL", "CHLA", "CHLT", "CHLF", "CHLPH", "CHL", "FLUO", "FLU2", "FLUOR", "CPWC")
+
+
+def _sql_code_list(codes) -> str:
+    """Render a tuple of parameter codes as an uppercase SQL IN-list."""
+    return ", ".join("'" + c.upper().replace("'", "''") + "'" for c in codes)
+
+
+def _profile_sql(instrument_type: str, order_by: str) -> str:
+    return f"""
         SELECT
             r.sample_number,
             MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
@@ -414,36 +426,25 @@ def fetch_profile(operation_id: int) -> pd.DataFrame:
             MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
             MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
             MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
-            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
+            MAX(CASE WHEN UPPER(p.parameter_code) IN ({_sql_code_list(OXY_CODES)}) THEN r.value_dec END) AS oxygen,
+            MAX(CASE WHEN UPPER(p.parameter_code) IN ({_sql_code_list(CHL_CODES)}) THEN r.value_dec END) AS chlorophyll
         FROM readings r
         JOIN parameters  p USING (parameter_id)
         JOIN instruments i USING (instrument_id)
         WHERE i.operation_id = ?
-          AND i.instrument_type = 'CTD'
+          AND i.instrument_type = '{instrument_type}'
         GROUP BY r.sample_number
-        ORDER BY pressure NULLS LAST
-    """, [operation_id]).df()
+        ORDER BY {order_by}
+    """
+
+
+def fetch_profile(operation_id: int) -> pd.DataFrame:
+    return con.execute(_profile_sql("CTD", "pressure NULLS LAST"), [operation_id]).df()
 
 
 # ── fetch bottle (BOT) discrete samples for one operation ────────────────────
 def fetch_bot_profile(operation_id: int) -> pd.DataFrame:
-    return con.execute("""
-        SELECT
-            r.sample_number,
-            MAX(CASE WHEN p.parameter_code = 'PRES'          THEN r.value_dec END) AS pressure,
-            MAX(CASE WHEN p.parameter_code = 'DEPTH'         THEN r.value_dec END) AS depth,
-            MAX(CASE WHEN p.parameter_code = 'TEMP'          THEN r.value_dec END) AS temperature,
-            MAX(CASE WHEN p.parameter_code = 'PSAL'          THEN r.value_dec END) AS salinity,
-            MAX(CASE WHEN p.parameter_code = 'PSAL_ADJUSTED' THEN r.value_dec END) AS salinity_adj,
-            MAX(CASE WHEN p.parameter_code = 'DOXY'          THEN r.value_dec END) AS oxygen
-        FROM readings r
-        JOIN parameters  p USING (parameter_id)
-        JOIN instruments i USING (instrument_id)
-        WHERE i.operation_id = ?
-          AND i.instrument_type = 'BOT'
-        GROUP BY r.sample_number
-        ORDER BY depth NULLS LAST, pressure NULLS LAST
-    """, [operation_id]).df()
+    return con.execute(_profile_sql("BOT", "depth NULLS LAST, pressure NULLS LAST"), [operation_id]).df()
 
 
 # ── build Folium map ──────────────────────────────────────────────────────────
@@ -581,9 +582,10 @@ def build_profile_chart(df: pd.DataFrame, op_id: int,
         has_temp_ctd  = df["temperature"].notna().any()
         has_sal_ctd   = df[sal_col_ctd].notna().any()
         has_oxy_ctd   = df["oxygen"].notna().any()
+        has_chl_ctd   = "chlorophyll" in df.columns and df["chlorophyll"].notna().any()
     else:
         sal_col_ctd = "salinity"; sal_label_ctd = "Salinity (PSU)"
-        has_temp_ctd = has_sal_ctd = has_oxy_ctd = False
+        has_temp_ctd = has_sal_ctd = has_oxy_ctd = has_chl_ctd = False
 
     if show_bot:
         use_sal_adj_bot = "salinity_adj" in bot_df.columns and bot_df["salinity_adj"].notna().any()
@@ -592,22 +594,25 @@ def build_profile_chart(df: pd.DataFrame, op_id: int,
         has_temp_bot  = bot_df["temperature"].notna().any()
         has_sal_bot   = bot_df[sal_col_bot].notna().any()
         has_oxy_bot   = bot_df["oxygen"].notna().any()
+        has_chl_bot   = "chlorophyll" in bot_df.columns and bot_df["chlorophyll"].notna().any()
     else:
         sal_col_bot = "salinity"; sal_label_bot = "Salinity (PSU)"
-        has_temp_bot = has_sal_bot = has_oxy_bot = False
+        has_temp_bot = has_sal_bot = has_oxy_bot = has_chl_bot = False
 
     has_temp = has_temp_ctd or has_temp_bot
     has_sal  = has_sal_ctd  or has_sal_bot
     has_oxy  = has_oxy_ctd  or has_oxy_bot
+    has_chl  = has_chl_ctd  or has_chl_bot
     sal_label = sal_label_ctd if has_sal_ctd else sal_label_bot
 
-    n_cols = int(sum([has_temp, has_sal, has_oxy]))
+    n_cols = int(sum([has_temp, has_sal, has_oxy, has_chl]))
     if n_cols == 0:
         return None
 
     titles = [t for t, h in [("Temperature (°C)", has_temp),
                                (sal_label,          has_sal),
-                               ("Oxygen",           has_oxy)] if h]
+                               ("Oxygen",           has_oxy),
+                               ("Chlorophyll a",    has_chl)] if h]
 
     fig = make_subplots(rows=1, cols=n_cols, shared_yaxes=True, subplot_titles=titles,
                         horizontal_spacing=0.06)
@@ -657,6 +662,21 @@ def build_profile_chart(df: pd.DataFrame, op_id: int,
                 x=bot_df["oxygen"], y=ybot, mode="markers",
                 marker=dict(color="#0f9d58", size=7, symbol="circle"),
                 name="Oxy (BOT)", showlegend=both,
+            ), row=1, col=col)
+        col += 1
+
+    if has_chl:
+        if show_ctd and has_chl_ctd:
+            fig.add_trace(go.Scatter(
+                x=df["chlorophyll"], y=yctd, mode="lines",
+                line=dict(color="#8e24aa", width=2),
+                name="ChlA (CTD)", showlegend=both,
+            ), row=1, col=col)
+        if show_bot and has_chl_bot:
+            fig.add_trace(go.Scatter(
+                x=bot_df["chlorophyll"], y=ybot, mode="markers",
+                marker=dict(color="#8e24aa", size=7, symbol="circle"),
+                name="ChlA (BOT)", showlegend=both,
             ), row=1, col=col)
 
     fig.update_yaxes(autorange="reversed", title_text=yaxis_label, row=1, col=1)
@@ -860,16 +880,17 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
     One row = one sample_number within one operation + instrument_type.
     Mission and operation metadata are repeated on every row.
 
-    Units are never mixed within a column: if a parameter code appears with
-    more than one distinct unit across the selected operations (e.g. oxygen in
-    ml/l vs µmol/kg), each (code, unit) gets its own column so incomparable
-    values are kept apart.
+    Values are never mixed within a column: if a parameter code appears with
+    more than one unit (e.g. oxygen in ml/l vs µmol/kg) OR the same unit on
+    different reference scales (e.g. salinity), each distinct (unit, scale)
+    signature gets its own column so incomparable values are kept apart.
 
-    Returns (dataframe, {column_name: unit}). The unit map keys match the
-    parameter/QC column names exactly, so callers can label without guessing.
+    Returns (dataframe, {column: unit}, {column: reference_scale}). Both maps'
+    keys match the parameter/QC column names exactly, so callers can label
+    without guessing.
     """
     if not operation_ids:
-        return pd.DataFrame(), {}
+        return pd.DataFrame(), {}, {}
 
     ids_sql = ",".join(str(i) for i in operation_ids)
 
@@ -900,6 +921,7 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
             i.instrument_model,
             p.parameter_code,
             p.units,
+            p.reference_scale,
             r.sample_number,
             r.value_datetime,
             r.value_dec,
@@ -916,7 +938,7 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
     """).df()
 
     if raw.empty:
-        return raw, {}
+        return raw, {}, {}
 
     # Metadata columns repeated on every row (carried via merge, not used as pivot index)
     # instrument_type is part of the pivot index — CTD and BOT are separate profiles
@@ -928,27 +950,51 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
         "instrument_serial_number", "instrument_model",
     ]
 
-    # ── unit-aware column keys ────────────────────────────────────────────────
-    # A parameter code that appears with >1 distinct unit across the selected
-    # operations is not comparable across those units, so give each unit its own
-    # column (code + "__" + sanitized-unit). Single-unit codes keep the bare code.
-    raw["units"] = raw["units"].fillna("").astype(str).str.strip()
-    units_by_code = raw.groupby("parameter_code")["units"].agg(lambda s: sorted(set(s)))
-    split_codes   = {code for code, us in units_by_code.items() if len(us) > 1}
+    # ── unit- and scale-aware column keys ─────────────────────────────────────
+    # Values are incomparable — and must not share a column — when a parameter
+    # code appears with more than one unit (e.g. oxygen ml/l vs µmol/kg) OR the
+    # same unit on different reference scales (e.g. salinity on different scales).
+    # A code with more than one distinct (unit, reference_scale) signature is
+    # split into one column per signature. The disambiguating suffix carries only
+    # the dimension(s) that actually vary, so names stay as short as possible:
+    #   code               — single signature
+    #   code__<unit>       — only the unit varies
+    #   code__<scale>      — only the reference scale varies
+    #   code__<unit>__<scale> — both vary
+    raw["units"]           = raw["units"].fillna("").astype(str).str.strip()
+    raw["reference_scale"] = raw["reference_scale"].fillna("").astype(str).str.strip()
 
-    def _col_key(code, unit):
-        return f"{code}__{_sanitize_unit(unit)}" if code in split_codes else code
+    variants   = raw[["parameter_code", "units", "reference_scale"]].drop_duplicates()
+    units_of, scales_of, nsig = {}, {}, {}
+    for code, sub in variants.groupby("parameter_code"):
+        units_of[code]  = set(sub["units"])
+        scales_of[code] = set(sub["reference_scale"])
+        nsig[code]      = len(sub)   # distinct (unit, scale) signatures
 
-    raw["col_key"] = [_col_key(c, u) for c, u in zip(raw["parameter_code"], raw["units"])]
+    def _col_key(code, unit, scale):
+        if nsig.get(code, 1) <= 1:
+            return code
+        parts = [code]
+        if len(units_of[code])  > 1: parts.append(_sanitize_unit(unit))
+        if len(scales_of[code]) > 1: parts.append(_sanitize_unit(scale))
+        return "__".join(parts)
 
-    # Map each resulting column (value + QC) to its unit and base code
+    raw["col_key"] = [_col_key(c, u, sc) for c, u, sc in
+                      zip(raw["parameter_code"], raw["units"], raw["reference_scale"])]
+
+    # Map each resulting column (value + QC) to its unit, reference scale, base code
     key_to_code: dict = {}
     unit_map:    dict = {}
-    for code, unit, key in zip(raw["parameter_code"], raw["units"], raw["col_key"]):
+    scale_map:   dict = {}
+    for code, unit, scale, key in zip(raw["parameter_code"], raw["units"],
+                                      raw["reference_scale"], raw["col_key"]):
         key_to_code[key] = code
         if unit:
             unit_map[key]          = unit
             unit_map[f"{key}_QC"]  = unit
+        if scale:
+            scale_map[key]         = scale
+            scale_map[f"{key}_QC"] = scale
 
     # Deduplicate on the pivot key so (op, instrument_type, sample, col_key) is unique
     raw = raw.drop_duplicates(subset=["operation_id", "instrument_type", "sample_number", "col_key"])
@@ -998,7 +1044,7 @@ def build_export_df(operation_ids: tuple, data_type_filter: str = "CTD + BOT"):
     final_cols = (["operation_id", "instrument_type", "sample_number", "value_datetime"] +
                   [c for c in meta_cols if c not in ["operation_id"]] +
                   ordered_params + ordered_qc)
-    return result[[c for c in final_cols if c in result.columns]], unit_map
+    return result[[c for c in final_cols if c in result.columns]], unit_map, scale_map
 
 
 def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
@@ -1014,7 +1060,8 @@ def _rename_with_units(df: pd.DataFrame, param_units: dict) -> pd.DataFrame:
     return df.rename(columns=rename) if rename else df
 
 
-def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
+def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None,
+                    param_scales: dict = None) -> bytes:
     """
     Convert wide-format export DataFrame to NetCDF4 with a 2D (profile × obs) layout.
 
@@ -1099,8 +1146,16 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
         data_vars["value_datetime_epoch"] = (["profile", "obs"], dt_2d)
         encoding["value_datetime_epoch"]  = enc_f64.copy()
 
+    def _var_attrs(name):
+        a = {}
+        if param_units and name in param_units:
+            a["units"] = param_units[name]
+        if param_scales and name in param_scales:
+            a["reference_scale"] = param_scales[name]
+        return a
+
     for col in param_cols:
-        attrs  = {"units": param_units[col]} if param_units and col in param_units else {}
+        attrs  = _var_attrs(col)
         arr2d  = _2d_f32(edf[col])
         data_vars[col] = xr.Variable(["profile", "obs"], arr2d, attrs=attrs) if attrs else (["profile", "obs"], arr2d)
         encoding[col]  = enc_f32.copy()
@@ -1111,7 +1166,7 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
             qc_2d  = np.full((n_profiles, max_obs), -1, dtype=np.int8)
             valid  = ~np.isnan(qc_num)
             qc_2d[profile_pos[valid], obs_pos[valid]] = qc_num[valid].astype(np.int8)
-            qc_attrs = {"units": param_units[col]} if param_units and col in param_units else {}
+            qc_attrs = _var_attrs(qc_col)
             data_vars[qc_col] = xr.Variable(["profile", "obs"], qc_2d, attrs=qc_attrs) if qc_attrs else (["profile", "obs"], qc_2d)
             encoding[qc_col]  = enc_i8.copy()
 
@@ -1169,7 +1224,10 @@ def to_netcdf_bytes(export_df: pd.DataFrame, param_units: dict = None) -> bytes:
                 "Drop fill rows: p = ds.isel(profile=i, obs=(ds.isel(profile=i).sample_number.values != -9999)). "
                 "instrument_type: 'CTD', 'BOT', or '' (empty=unknown); 1D on profile dimension. "
                 "Filter CTD profiles: ds.isel(profile=(ds.instrument_type=='CTD').values). "
-                "Profile metadata (lat, lon, time_start_epoch ...) is on the profile dimension."
+                "Profile metadata (lat, lon, time_start_epoch ...) is on the profile dimension. "
+                "A parameter measured with more than one unit or reference scale is split into "
+                "separate variables (e.g. DOXY__ml_l, DOXY__umol_kg; PSAL__<scale>); each variable's "
+                "'units' and 'reference_scale' attributes give its exact provenance."
             ),
         }
     )
@@ -1320,23 +1378,25 @@ if not df.empty:
     with prep_col:
         if st.button("Prepare downloads", type="primary", width='stretch', key="prep_dl"):
             # Clear any previous export for this result set
-            for suffix in ["_csv", "_nc", "_nc_err", "_xl", "_edf", "_units"]:
+            for suffix in ["_csv", "_nc", "_nc_err", "_xl", "_edf", "_units", "_scales"]:
                 st.session_state.pop(export_key + suffix, None)
 
-            # Step 1: build the base dataframe (+ unit map keyed to its columns)
+            # Step 1: build the base dataframe (+ unit/scale maps keyed to its columns)
             with st.spinner("Building export dataset..."):
-                edf, edf_units = build_export_df(op_ids, data_type_filter)
-                st.session_state[export_key + "_edf"]   = edf
-                st.session_state[export_key + "_units"] = edf_units
+                edf, edf_units, edf_scales = build_export_df(op_ids, data_type_filter)
+                st.session_state[export_key + "_edf"]    = edf
+                st.session_state[export_key + "_units"]  = edf_units
+                st.session_state[export_key + "_scales"] = edf_scales
             st.rerun()  # show CSV button immediately
 
     # Render columns for whatever is ready so far
     dl_col1, dl_col2, dl_col3 = st.columns(3)
 
     edf = st.session_state.get(export_key + "_edf")
-    # Unit map built alongside edf — keys match its columns exactly (incl. any
-    # unit-split columns), so labels are always correct and never mixed.
-    param_units = st.session_state.get(export_key + "_units", {})
+    # Unit/scale maps built alongside edf — keys match its columns exactly (incl.
+    # any split columns), so labels are always correct and never mixed.
+    param_units  = st.session_state.get(export_key + "_units", {})
+    param_scales = st.session_state.get(export_key + "_scales", {})
 
     # ── CSV ───────────────────────────────────────────────────────────────────
     with dl_col1:
@@ -1367,7 +1427,7 @@ if not df.empty:
             st.caption(f"Error: {st.session_state[export_key + '_nc_err']}")
         elif export_key + "_nc" not in st.session_state:
             try:
-                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf, param_units=param_units)
+                st.session_state[export_key + "_nc"] = to_netcdf_bytes(edf, param_units=param_units, param_scales=param_scales)
             except Exception as e:
                 st.session_state[export_key + "_nc_err"] = str(e)
             st.rerun()
