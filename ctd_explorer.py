@@ -405,11 +405,12 @@ def run_query(date_start, date_end, lat_min, lat_max, lon_min, lon_max, platform
 
 
 # ── fetch T/S profile for one operation ──────────────────────────────────────
-# Parameter-code aliases. Physchem uses 'DOXY' for oxygen; chlorophyll-a can
-# appear under several codes depending on sensor / processing chain. Matched
-# case-insensitively — adjust these lists if a dataset uses a different code.
-OXY_CODES = ("DOXY",)
-CHL_CODES = ("CPHL", "CHLA", "CHLT", "CHLF", "CHLPH", "CHL", "FLUO", "FLU2", "FLUOR", "CPWC")
+# Parameter-code aliases (matched case-insensitively). These are the codes this
+# IMR physchem database actually uses — adjust if the source ever changes them.
+#   Oxygen:       DOX (sensor). DOXY kept as a harmless legacy alias.
+#   Chlorophyll-a: Chl_SENS / ChlA_SENS (in-situ fluorescence) and ChlA (lab).
+OXY_CODES = ("DOX", "DOXY")
+CHL_CODES = ("CHLA", "CHLA_SENS", "CHL_SENS", "CPHL")
 
 
 def _sql_code_list(codes) -> str:
